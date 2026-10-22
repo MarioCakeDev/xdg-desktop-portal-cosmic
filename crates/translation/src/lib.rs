@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 0da621db9166852fe5deffaefa2f646535538141 (crates/translation).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 5a5c1987659adbec8d2d686f034a753ca6bb81bb (crates/translation).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! Vendor-neutral machine translation.

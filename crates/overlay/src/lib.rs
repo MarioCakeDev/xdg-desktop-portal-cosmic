@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 0da621db9166852fe5deffaefa2f646535538141 (crates/overlay).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 5a5c1987659adbec8d2d686f034a753ca6bb81bb (crates/overlay).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! Paint translated text over the original glyphs, in place.
@@ -400,9 +400,10 @@ pub fn overlay(
             continue;
         }
 
-        // Sample colours before the original glyphs are painted over.
-        let background = color::background(canvas, cover);
-        let foreground = color::foreground(canvas, cover, background, options.min_contrast);
+        // Sample colours before the original glyphs are painted over. The pair
+        // is checked against WCAG contrast here, not left to chance: a box that
+        // spans two papers used to get a mid-grey cover and light ink on it.
+        let (background, foreground) = color::pair(canvas, cover, options.min_contrast);
         fill(canvas, cover, background);
 
         if block.text.trim().is_empty() {

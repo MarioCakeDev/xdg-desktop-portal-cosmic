@@ -3,7 +3,7 @@
 //! nothing outside the box may be touched.
 
 use cosmic_screenshot_overlay::{
-    Canvas, FontSet, Options, Rect, Script, TranslatedBlock, cover_rect, overlay,
+    Canvas, FontSet, Options, Rect, Script, TranslatedBlock, color, cover_rect, overlay,
 };
 
 fn latin() -> FontSet {
@@ -145,4 +145,54 @@ fn blocks_outside_the_image_are_skipped() {
     let report = overlay(&mut canvas, &[outside], &latin(), &Options::default());
     assert_eq!(report.skipped, 1);
     assert_eq!(report.drawn, 0);
+}
+
+#[test]
+fn a_block_straddling_a_selection_stays_readable() {
+    // The shape of the failing capture: a dark page, a light selection, and a
+    // line whose cover ring is half selection, half page. The ring's median is
+    // a mid-grey that exists nowhere on screen; the pair drawn on it has to
+    // read anyway, and the cover has to be one of the two real papers.
+    let mut canvas = Canvas::filled(320, 160, [14, 14, 16, 255]);
+    for y in 24..120 {
+        for x in 18..302 {
+            canvas.set_pixel(x, y, [207, 228, 245, 255]);
+        }
+    }
+    for y in 60..74 {
+        for x in 40..280 {
+            canvas.set_pixel(x, y, [20, 20, 24, 255]);
+        }
+    }
+
+    // The last selected line: its box starts inside the selection and its
+    // cover margin reaches into the page below it.
+    let block = TranslatedBlock {
+        rect: Rect::new(38.0, 108.0, 246.0, 16.0),
+        text: "die Schwachstellen im Detail".to_string(),
+    };
+    let cover = cover_rect(block.rect, &Options::default(), canvas.width, canvas.height);
+    let (fill, ink) = color::pair(&canvas, cover, Options::default().min_contrast);
+    assert!(
+        fill == [207, 228, 245, 255] || fill == [14, 14, 16, 255],
+        "the cover must be one of the two papers, got {fill:?}"
+    );
+    assert!(
+        color::contrast_ratio(fill, ink) >= color::MIN_TEXT_CONTRAST,
+        "cover {fill:?} with ink {ink:?} does not read"
+    );
+
+    let report = overlay(&mut canvas, &[block], &latin(), &Options::default());
+    assert_eq!(report.drawn, 1);
+    // The old glyph bar is gone from the covered area, and the drawn text is
+    // the ink the pair named.
+    let mut inked = 0;
+    for y in cover.y as u32..cover.bottom() as u32 {
+        for x in cover.x as u32..cover.right() as u32 {
+            if color::luminance(canvas.pixel(x, y)) < color::luminance(fill) - 40.0 {
+                inked += 1;
+            }
+        }
+    }
+    assert!(inked > 20, "no readable glyphs were drawn ({inked})");
 }
