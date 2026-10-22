@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at abfcd029232c4c58081cc6403a54b9803c6a9324 (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 3316fb9af624f821d4e7e4e5957dcb202b196d40 (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -750,13 +750,22 @@ fn is_readable(text: &str) -> bool {
     enough && other * 2 <= letters + other
 }
 
-/// Two-letter UI words that are real labels, not fragments. An icon read as
-/// `Ei` is not on this list.
-const SHORT_LABELS: [&str; 5] = ["ok", "no", "on", "up", "go"];
+/// Two-letter UI words that are real labels, not fragments, across the
+/// languages the tool translates. An icon read as `Ei` is not on this list.
+const SHORT_LABELS: [&str; 13] = [
+    "ok", "no", "on", "up", "go", "ja", "sí", "si", "da", "ya", "да", "не", "ні",
+];
 
 fn is_short_ui_label(text: &str) -> bool {
     let trimmed = text.trim_matches(|character: char| !character.is_alphanumeric());
-    SHORT_LABELS.contains(&trimmed.to_lowercase().as_str())
+    let lower = trimmed.to_lowercase();
+    if SHORT_LABELS.contains(&lower.as_str()) {
+        return true;
+    }
+    // Kana, Han and Hangul are written without spaces, so a two-character block
+    // is a word (`はい`), not the kind of two-letter fragment `Ei` is.
+    let characters: Vec<char> = trimmed.chars().collect();
+    characters.len() == 2 && characters.iter().all(|character| is_cjk(*character))
 }
 
 /// One word Tesseract returned, kept with its own box so paint areas can be
@@ -933,6 +942,10 @@ fn cluster_line(words: &[Word], global_gap: Option<u32>) -> Vec<Vec<&Word>> {
         global_gap
     }
     .unwrap_or(height / 2)
+    // A page whose rows are mostly two columns has a median gap that *is* the
+    // column gap. Capping the basis below the height floor keeps 2×basis from
+    // outvoting 1.2×height and merging those rows.
+    .min(height / 2)
     .max(1);
     let split = ((basis as f32 * 2.0).max(height as f32 * 1.2)).round() as u32;
 
@@ -1099,6 +1112,32 @@ mod tests {
     }
 
     #[test]
+    fn a_page_of_two_column_rows_still_splits_them() {
+        // Every row is two columns, so the page median gap is the column gap.
+        // Without the height cap, 2 × 300 beats 1.2 × 198 and both rows merge.
+        let row = |line: u32, y: u32| {
+            format!(
+                "5\t1\t1\t1\t{line}\t1\t400\t{y}\t800\t198\t79\tAdvancements\n\
+                 5\t1\t1\t1\t{line}\t2\t1500\t{y}\t1049\t198\t77\tStatistics\n"
+            )
+        };
+        let tsv = format!(
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n{}{}",
+            row(1, 1214),
+            row(2, 1502)
+        );
+        let blocks = parse_tsv(&tsv);
+        assert_eq!(blocks.len(), 4, "{blocks:#?}");
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Advancements", "Statistics", "Advancements", "Statistics"]
+        );
+    }
+
+    #[test]
     fn three_words_on_one_line_still_split_at_a_column_gap() {
         // Two words of one label and one word of the next column: with only two
         // gaps, the upper median would be the column gap itself and nothing
@@ -1140,6 +1179,10 @@ mod tests {
         assert!(is_readable("OK"));
         assert!(is_readable("No"));
         assert!(is_readable("Back to Game"));
+        // Short labels in the other supported languages are words, not junk.
+        for label in ["Ja", "Sí", "Da", "Ya", "Да", "Не", "Ні", "はい", "是的"] {
+            assert!(is_readable(label), "{label} is a real label");
+        }
     }
 
     #[test]

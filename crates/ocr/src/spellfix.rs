@@ -15,6 +15,11 @@
 //! Nothing here invents text: a token is either unchanged or replaced by a
 //! vocabulary word, and every replacement is reported so the run log can show
 //! when the corrector fired.
+//!
+//! The corrector is also **English-gated**: it only runs on a line that already
+//! contains an exact vocabulary word. A German line (`Musik`, `Menü`,
+//! `Optionen`) has no such anchor, so its real words are never rewritten into
+//! English look-alikes.
 
 /// A token the corrector replaced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +96,16 @@ const MAX_DISTANCE: usize = 2;
 pub fn correct_line(tokens: &[&str]) -> (Vec<String>, Vec<Correction>) {
     let mut corrected: Vec<String> = tokens.iter().map(|token| token.to_string()).collect();
     let mut corrections = Vec::new();
+
+    // English-gate: a line with no exact UI word is probably not English, and
+    // rewriting `Musik` or `Menü` into an English look-alike would be wrong.
+    let anchored = tokens.iter().any(|token| {
+        let lower = token.to_lowercase();
+        UI_WORDS.contains(&lower.as_str())
+    });
+    if !anchored {
+        return (corrected, corrections);
+    }
 
     for (position, token) in tokens.iter().enumerate() {
         if !is_plain_word(token) || token.chars().count() < MIN_LENGTH {
@@ -230,7 +245,17 @@ mod tests {
     #[test]
     fn one_edit_typos_are_repaired() {
         assert_eq!(corrected(&["Gack", "to", "Game"]), ["Back", "to", "Game"]);
-        assert_eq!(corrected(&["Disconect"]), ["Disconnect"]);
+        assert_eq!(corrected(&["Disconect", "Game"]), ["Disconnect", "Game"]);
+    }
+
+    #[test]
+    fn a_line_without_an_english_anchor_is_left_alone() {
+        // Real words in other languages must not be rewritten into English
+        // look-alikes; none of these lines contains an exact UI word.
+        assert_eq!(corrected(&["Musik", "Lautstärke"]), ["Musik", "Lautstärke"]);
+        assert_eq!(corrected(&["Menü", "Optionen"]), ["Menü", "Optionen"]);
+        assert_eq!(corrected(&["Musica"]), ["Musica"]);
+        assert_eq!(corrected(&["Disconect"]), ["Disconect"]);
     }
 
     #[test]
@@ -246,9 +271,9 @@ mod tests {
 
     #[test]
     fn case_is_preserved() {
-        assert_eq!(corrected(&["GACK"]), ["BACK"]);
-        assert_eq!(corrected(&["gack"]), ["back"]);
-        assert_eq!(corrected(&["Gack"]), ["Back"]);
+        assert_eq!(corrected(&["GACK", "Game"]), ["BACK", "Game"]);
+        assert_eq!(corrected(&["gack", "Game"]), ["back", "Game"]);
+        assert_eq!(corrected(&["Gack", "Game"]), ["Back", "Game"]);
     }
 
     #[test]
@@ -263,8 +288,8 @@ mod tests {
 
     #[test]
     fn punctuation_is_never_rewritten() {
-        assert_eq!(corrected(&["Options..."]), ["Options..."]);
-        assert_eq!(corrected(&["|"]), ["|"]);
+        assert_eq!(corrected(&["Options...", "Game"]), ["Options...", "Game"]);
+        assert_eq!(corrected(&["|", "Game"]), ["|", "Game"]);
     }
 
     #[test]

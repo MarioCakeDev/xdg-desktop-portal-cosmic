@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at abfcd029232c4c58081cc6403a54b9803c6a9324 (crates/engine).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 3316fb9af624f821d4e7e4e5957dcb202b196d40 (crates/engine).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! The translate-the-capture pipeline: OCR, auto-detect, translate, overlay.
