@@ -476,6 +476,23 @@ fn target_index(stored: Option<&str>) -> usize {
         })
 }
 
+/// The screenshot settings to persist after the picker moved to `index`.
+///
+/// `None` when `index` is outside the table (a stale widget, not a pick). The
+/// returned value is what [`crate::app::CosmicPortal::save_screenshot_config`]
+/// writes; it must not be installed into the in-memory config beforehand, or
+/// the setter's "only write when changed" check skips the file.
+fn language_pick(
+    current: &config::screenshot::Screenshot,
+    index: usize,
+) -> Option<config::screenshot::Screenshot> {
+    let info = lang::LANGS.get(index)?;
+    Some(config::screenshot::Screenshot {
+        target_language: Some(info.code.to_string()),
+        ..current.clone()
+    })
+}
+
 struct Output {
     output: WlOutput,
     logical_position: (i32, i32),
@@ -957,30 +974,23 @@ pub fn update_msg(
             }
         }
         Msg::TargetLanguage(index) => {
-            let Some(info) = lang::LANGS.get(index) else {
+            // Remember the pick the moment it is made: an aborted or failed
+            // translate must not lose it, and the next dialog opens on it.
+            let Some(next) = language_pick(&portal.config.screenshot, index) else {
                 tracing::error!("TargetLanguage index {index} is outside the language table.");
                 return cosmic::Task::none();
             };
-            let code = info.code.to_string();
             if let Some(args) = portal.screenshot_args.as_mut() {
                 args.target_index = index;
             } else {
                 tracing::error!("Failed to find screenshot Args for TargetLanguage message.");
             }
-            // Remember the pick the moment it is made: an aborted or failed
-            // translate must not lose it, and the next dialog opens on it.
-            let choice = (&mut portal.config.screenshot.choice).into();
-            let next = config::screenshot::Screenshot {
-                choice,
-                last_rectangle: portal.config.screenshot.last_rectangle,
-                target_language: Some(code),
-                save_location: portal.config.screenshot.save_location,
-            };
-            // Keep the in-memory copy in step too: the Choice and Location
-            // handlers write the whole struct from it, and a stale copy would
-            // drop the language again on the next save.
-            portal.config.screenshot = next.clone();
-            cosmic::task::message(crate::app::Msg::ConfigSetScreenshot(next))
+            // Write now, not through a `ConfigSetScreenshot` task: the setter
+            // ignores a value equal to the in-memory config, and this arm used
+            // to assign `next` first, so the pick never reached the file even
+            // though it did take effect in memory. Let the setter install it.
+            portal.save_screenshot_config(next);
+            cosmic::Task::none()
         }
         Msg::Translate { output } => {
             if portal.screenshot_args.is_none() {
@@ -1284,6 +1294,128 @@ pub fn update_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real `cosmic_config::Config` rooted in a throwaway directory, so the
+    /// tests write and re-read the same key the running portal uses.
+    fn temp_config() -> (tempfile::TempDir, cosmic::cosmic_config::Config) {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let handler = cosmic::cosmic_config::Config::with_custom_path(
+            config::APP_ID,
+            config::CONFIG_VERSION,
+            dir.path().to_path_buf(),
+        )
+        .expect("temp config handler");
+        (dir, handler)
+    }
+
+    /// The key file under the temp config dir (`…/v1/screenshot`).
+    fn screenshot_key(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path()
+            .join("cosmic")
+            .join(config::APP_ID)
+            .join(format!("v{}", config::CONFIG_VERSION))
+            .join("screenshot")
+    }
+
+    /// Re-read what a running portal would see after a restart.
+    fn reload(handler: &cosmic::cosmic_config::Config) -> config::Config {
+        config::Config::get_entry(handler).expect("config reads back")
+    }
+
+    fn german() -> usize {
+        lang::LANGS
+            .iter()
+            .position(|row| row.code == "de")
+            .expect("German is in the table")
+    }
+
+    /// A portal with just enough state for the config messages. No screenshot
+    /// args: the arm logs that, but the save must happen regardless.
+    fn test_portal(handler: cosmic::cosmic_config::Config) -> CosmicPortal {
+        CosmicPortal {
+            core: cosmic::app::Core::default(),
+            tx: None,
+            config_handler: Some(handler),
+            config: config::Config::default(),
+            access_args: None,
+            file_choosers: Default::default(),
+            screenshot_args: None,
+            screencast_args: None,
+            screencast_tab_model: Default::default(),
+            remote_desktop_args: None,
+            location_options: Vec::new(),
+            prev_rectangle: None,
+            wayland_helper: None,
+            outputs: Vec::new(),
+            active_output: None,
+            dummy_id: window::Id::unique(),
+        }
+    }
+
+    #[test]
+    fn picking_a_language_writes_it_to_the_config_file() {
+        let (dir, handler) = temp_config();
+        let mut portal = test_portal(handler.clone());
+
+        let _ = update_msg(&mut portal, Msg::TargetLanguage(german()));
+
+        // The dialog keeps it in memory for the rest of this dialog…
+        assert_eq!(
+            portal.config.screenshot.target_language.as_deref(),
+            Some("de")
+        );
+        // …and the pick is on disk, which is what the next dialog and a
+        // restart read. This is the assertion the old code failed: the
+        // in-memory copy was assigned first, so `set_screenshot` saw no change
+        // and wrote nothing.
+        assert_eq!(
+            reload(&handler).screenshot.target_language.as_deref(),
+            Some("de")
+        );
+        let raw = std::fs::read_to_string(screenshot_key(&dir)).expect("screenshot key written");
+        assert!(
+            raw.contains(r#"target_language: Some("de")"#),
+            "language missing from {raw}"
+        );
+    }
+
+    #[test]
+    fn a_choice_save_after_the_pick_keeps_the_language() {
+        let (dir, handler) = temp_config();
+        let mut portal = test_portal(handler.clone());
+        let _ = update_msg(&mut portal, Msg::TargetLanguage(german()));
+
+        // Exactly what `Msg::Choice`/`Msg::Location` hand to
+        // `ConfigSetScreenshot`: the whole struct, rebuilt from the in-memory
+        // copy. A stale copy would resurrect `None` here.
+        let save = config::screenshot::Screenshot {
+            choice: config::screenshot::Choice::Rectangle,
+            last_rectangle: portal.config.screenshot.last_rectangle,
+            ..portal.config.screenshot.clone()
+        };
+        portal.save_screenshot_config(save);
+
+        let stored = reload(&handler).screenshot;
+        assert_eq!(stored.target_language.as_deref(), Some("de"));
+        assert_eq!(stored.choice, config::screenshot::Choice::Rectangle);
+
+        let raw = std::fs::read_to_string(screenshot_key(&dir)).expect("screenshot key written");
+        assert!(
+            raw.contains(r#"target_language: Some("de")"#),
+            "language dropped by a later save: {raw}"
+        );
+    }
+
+    #[test]
+    fn an_index_outside_the_table_writes_nothing() {
+        let (dir, handler) = temp_config();
+        let mut portal = test_portal(handler);
+
+        let _ = update_msg(&mut portal, Msg::TargetLanguage(lang::LANGS.len()));
+
+        assert_eq!(portal.config.screenshot.target_language, None);
+        assert!(!screenshot_key(&dir).exists(), "nothing should be written");
+    }
 
     #[test]
     fn the_dialog_opens_on_the_language_last_picked() {
