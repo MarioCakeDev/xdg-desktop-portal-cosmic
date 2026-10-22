@@ -1085,13 +1085,11 @@ pub fn update_msg(
             // the dialog stays responsive and a slow sidecar never freezes it.
             cosmic::Task::perform(
                 async move {
-                    tokio::task::spawn_blocking(move || {
-                        translate::run(name, base, region, target)
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        Err(format!("the translation task failed: {error}"))
-                    })
+                    tokio::task::spawn_blocking(move || translate::run(name, base, region, target))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("the translation task failed: {error}"))
+                        })
                 },
                 |result| cosmic::Action::App(crate::app::Msg::Screenshot(Msg::Translated(result))),
             )
@@ -1123,6 +1121,11 @@ pub fn update_msg(
                         height,
                         composited.as_raw().clone(),
                     );
+                    // Counts, not a verdict: one line translated out of ten
+                    // must not read as a success, and a run that painted
+                    // nothing says why. Built before `done.output` is moved
+                    // into the image map below.
+                    let status = status_line(&done);
                     args.output_images.insert(
                         done.output,
                         ScreenshotImage {
@@ -1130,52 +1133,59 @@ pub fn update_msg(
                             handle,
                         },
                     );
-                    // Counts, not a verdict: one line translated out of ten
-                    // must not read as a success, and a run that painted
-                    // nothing says why.
-                    args.status = Some(if done.same_language {
-                        format!(
-                            "this looks like {} already — pick another target language in the toolbar",
-                            done.target.name
-                        )
-                    } else if done.kept == 0 {
-                        if done.found == 0 {
-                            "no text found in the selected area — nothing to translate".to_string()
-                        } else {
-                            format!(
-                                "found {} line(s) but none readable — nothing translated",
-                                done.found
-                            )
-                        }
-                    } else if done.translated == 0 && done.drawn == 0 && done.skipped_code > 0 {
-                        format!(
-                            "the selection is code — {} line(s) left as they are",
-                            done.skipped_code
-                        )
-                    } else {
-                        let mut line = format!(
-                            "{} → {} · found {}, kept {}, translated {}, drawn {}",
-                            done.source,
-                            done.target.name,
-                            done.found,
-                            done.kept,
-                            done.translated,
-                            done.drawn
-                        );
-                        if done.skipped_code > 0 {
-                            line.push_str(&format!(
-                                " · {} code line(s) left as-is",
-                                done.skipped_code
-                            ));
-                        }
-                        line
-                    });
+                    args.status = Some(status);
                 }
                 Err(message) => args.status = Some(message),
             }
             cosmic::Task::none()
         }
     }
+}
+
+/// The one line under the toolbar after a run, from the run's own counts.
+///
+/// Counts, not a verdict: one line translated out of ten must not read as a
+/// success, and a run that painted nothing says why. `recovered` is named
+/// separately because those lines came from the opposite-polarity retry — the
+/// reading was not the crop's own polarity, and the user should be able to see
+/// that from the dialog rather than only in a debug trace.
+fn status_line(done: &translate::Translated) -> String {
+    if done.same_language {
+        return format!(
+            "this looks like {} already — pick another target language in the toolbar",
+            done.target.name
+        );
+    }
+    if done.kept == 0 {
+        return if done.found == 0 {
+            "no text found in the selected area — nothing to translate".to_string()
+        } else {
+            format!(
+                "found {} line(s) but none readable — nothing translated",
+                done.found
+            )
+        };
+    }
+    if done.translated == 0 && done.drawn == 0 && done.skipped_code > 0 {
+        return format!(
+            "the selection is code — {} line(s) left as they are",
+            done.skipped_code
+        );
+    }
+    let mut line = format!(
+        "{} → {} · found {}, kept {}, translated {}, drawn {}",
+        done.source, done.target.name, done.found, done.kept, done.translated, done.drawn
+    );
+    if done.recovered > 0 {
+        line.push_str(&format!(
+            " · {} recovered from the opposite polarity",
+            done.recovered
+        ));
+    }
+    if done.skipped_code > 0 {
+        line.push_str(&format!(" · {} code line(s) left as-is", done.skipped_code));
+    }
+    line
 }
 
 /// Set the one-line feedback under the toolbar, if the dialog still exists.
@@ -1439,5 +1449,65 @@ mod tests {
             let index = target_index(stored);
             assert!(index < lang::LANGS.len(), "{stored:?} -> {index}");
         }
+    }
+
+    /// A finished run, for the status-line tests: only the counts matter.
+    fn finished_run(
+        found: usize,
+        kept: usize,
+        translated: usize,
+        drawn: usize,
+        recovered: usize,
+        skipped_code: usize,
+    ) -> translate::Translated {
+        translate::Translated {
+            output: "DP-1".into(),
+            region: Region {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([0, 0, 0, 255]),
+            )),
+            target: lang::find("en").expect("English is in the table"),
+            source: "German".into(),
+            found,
+            kept,
+            translated,
+            drawn,
+            recovered,
+            skipped_code,
+            same_language: false,
+            debug_dir: None,
+        }
+    }
+
+    #[test]
+    fn the_status_line_names_the_lines_recovered_from_the_opposite_polarity() {
+        let line = status_line(&finished_run(9, 6, 6, 6, 2, 0));
+        assert_eq!(
+            line,
+            "German → English · found 9, kept 6, translated 6, drawn 6 · 2 recovered from the opposite polarity",
+            "the retry's lines are named, not folded into `kept`"
+        );
+
+        // A run that needed no retry keeps the plain line: no empty clause.
+        let plain = status_line(&finished_run(9, 6, 6, 6, 0, 0));
+        assert_eq!(
+            plain,
+            "German → English · found 9, kept 6, translated 6, drawn 6"
+        );
+        assert!(!plain.contains("recovered"), "no clause when nothing was");
+
+        // Both asides can appear, recovered first — the order `counts()` uses.
+        let both = status_line(&finished_run(9, 6, 6, 6, 1, 2));
+        assert!(
+            both.ends_with("· 1 recovered from the opposite polarity · 2 code line(s) left as-is"),
+            "{both}"
+        );
     }
 }

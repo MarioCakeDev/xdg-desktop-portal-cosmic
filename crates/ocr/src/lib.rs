@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 5a5c1987659adbec8d2d686f034a753ca6bb81bb (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at da39878207579773cfc5f1d04141c026ac0d3381 (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -32,7 +32,9 @@
 //! rows no recognised block covers that hold a flat area of the other colour
 //! are read once more, with the polarity flipped, and only the lines inside
 //! that band are kept ([`unread_bands`]). A busy region — a photo, an avatar —
-//! changes colour from row to row and never forms such a band.
+//! rarely forms such a band, and when it does nothing from it survives unless
+//! its inverted pixels read as credible text: the caps and the flatness test
+//! keep the retry to a flat block, the credibility filter keeps the output.
 //!
 //! Nothing here invents text: every block comes from a Tesseract pass over the
 //! pixels, and the optional corrector in [`spellfix`] only replaces a token
@@ -105,7 +107,9 @@ const FALLBACK_BELOW_LINES: usize = 2;
 /// again from its own rows. At most this many bands per crop…
 const MAX_RETRY_BANDS: usize = 4;
 
-/// Shorter than this (at the enlarged scale) is not a line of text.
+/// Shorter than this (in capture pixels) is not a line of text. The band is
+/// measured in prepared rows, so the floor scales with the image: at 2× it is
+/// 16 prepared rows, and a sliver of antialiasing does not count as a passage.
 const MIN_BAND_ROWS: u32 = 8;
 
 /// How far a row's opposite-pixel colour may drift and stay one band.
@@ -552,9 +556,10 @@ pub fn recognize_reading(image: &Path, config: &Config) -> Result<Reading, OcrEr
     Ok(chosen)
 }
 
-/// Which bands to read again, if any. Empty when no band survived the caps: a
-/// busy region (a photo, an avatar) is not a flat block and must not be
-/// translated from its inverted image.
+/// Which bands to read again, if any. Empty when no band survived the caps, or
+/// when the primary pass read nothing: a crop with no recognised line is a
+/// whole-crop polarity problem, not a block inside a page, and inverting it
+/// wholesale is a different decision than this retry makes.
 fn retry_bands(prepared: &Prepared, reading: &Reading) -> Vec<Band> {
     let Some(luma) = &prepared.luma else {
         return Vec::new();
@@ -569,18 +574,14 @@ fn retry_bands(prepared: &Prepared, reading: &Reading) -> Vec<Band> {
     if bands.is_empty() || bands.len() > MAX_RETRY_BANDS {
         return Vec::new();
     }
-    // The crop's own polarity has to have been right for *something*: a line
-    // outside every band proves this is a block inside a page and not a busy
-    // region read upside down. Without it the whole crop is the "block", and a
-    // wrong global polarity is a different problem.
-    let step = prepared.scale.max(1);
-    let evidence = reading.blocks.iter().any(|block| {
-        let centre = (block.bbox.y + block.bbox.height / 2).saturating_mul(step);
-        !bands
-            .iter()
-            .any(|band| centre >= band.top && centre < band.bottom)
-    });
-    if !evidence {
+    // The primary pass has to have read *something*. Note what this can and
+    // cannot prove: `unread_bands` only returns rows no recognised block
+    // covers, so "a line outside every band" is true by construction and
+    // decides nothing. What the retry actually relies on is the band test
+    // itself — a flat area of the opposite paper, capped at MAX_RETRY_BANDS —
+    // plus the credibility filter on what comes back, so a busy region is
+    // never *kept* from its inverted image even when a pass is spent on it.
+    if reading.blocks.is_empty() {
         return Vec::new();
     }
     bands
@@ -1027,7 +1028,7 @@ fn unread_bands(
                     current = Some((band, anchor));
                 }
                 Some((band, _)) => {
-                    push_band(&mut bands, band);
+                    push_band(&mut bands, band, scale);
                     current = Some((
                         Band {
                             top: row,
@@ -1048,13 +1049,13 @@ fn unread_bands(
             },
             None => {
                 if let Some((band, _)) = current.take() {
-                    push_band(&mut bands, band);
+                    push_band(&mut bands, band, scale);
                 }
             }
         }
     }
     if let Some((band, _)) = current {
-        push_band(&mut bands, band);
+        push_band(&mut bands, band, scale);
     }
     bands
 }
@@ -1104,8 +1105,9 @@ fn opposite_row(
     Some(winner[1] as f32 / total as f32)
 }
 
-fn push_band(bands: &mut Vec<Band>, band: Band) {
-    if band.height() >= MIN_BAND_ROWS {
+fn push_band(bands: &mut Vec<Band>, band: Band, scale: u32) {
+    // `band` is in prepared rows, `MIN_BAND_ROWS` in capture pixels.
+    if band.height() >= MIN_BAND_ROWS.saturating_mul(scale.max(1)) {
         bands.push(band);
     }
 }
@@ -2088,5 +2090,64 @@ mod tests {
             (0.02..0.6).contains(&share),
             "the passage's glyphs must be ink on its own paper, got {share}"
         );
+    }
+
+    #[test]
+    fn a_band_shorter_than_the_scaled_floor_is_dropped() {
+        // 12 prepared rows is a real band at 1× (12 capture px) and a sliver at
+        // 2× (6 capture px), so the same band must be kept at one scale and
+        // dropped at the other.
+        let band = Band { top: 0, bottom: 12 };
+        let mut kept = Vec::new();
+        push_band(&mut kept, band, 1);
+        assert_eq!(kept, vec![band], "12 capture rows is already a band");
+
+        let mut dropped = Vec::new();
+        push_band(&mut dropped, band, 2);
+        assert!(
+            dropped.is_empty(),
+            "at 2× the floor is 16 prepared rows, got 12"
+        );
+    }
+
+    #[test]
+    fn a_crop_the_primary_pass_read_nothing_from_is_not_retried() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_capture().save(&path).expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+
+        // The passage is a band in the pixels …
+        let bands = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert!(!bands.is_empty(), "the fixture holds a band to find");
+
+        // … but a reading with no recognised line is not "a block inside a
+        // page": the whole crop's polarity is the question there, and this
+        // retry must not invert it wholesale.
+        assert!(
+            retry_bands(&prepared, &Reading::default()).is_empty(),
+            "no recognised line means no retry"
+        );
+
+        // One recognised line is enough to make the band meaningful.
+        let mut reading = Reading::default();
+        reading.blocks.push(TextBlock {
+            bbox: Bbox {
+                x: 0,
+                y: 2,
+                width: 10,
+                height: 6,
+            },
+            text: "page".to_string(),
+            confidence: 90.0,
+        });
+        assert_eq!(retry_bands(&prepared, &reading).len(), 1);
     }
 }

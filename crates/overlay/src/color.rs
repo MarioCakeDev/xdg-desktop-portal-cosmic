@@ -53,6 +53,10 @@ const LIGHT_INK: [u8; 4] = [245, 245, 245, 255];
 /// This is what [`crate::overlay`] draws with: [`background`] for the fill,
 /// [`foreground`] for the ink, then the pair enforced against
 /// [`MIN_TEXT_CONTRAST`].
+///
+/// `min_contrast` only reaches [`foreground`], where it decides which pixels
+/// count as ink. The readability guarantee below is always
+/// [`MIN_TEXT_CONTRAST`], never the caller's value.
 pub fn pair(canvas: &Canvas, rect: Rect, min_contrast: f32) -> ([u8; 4], [u8; 4]) {
     let mut fill = background(canvas, rect);
     let mut ink = foreground(canvas, rect, fill, min_contrast);
@@ -124,7 +128,9 @@ pub fn background(canvas: &Canvas, rect: Rect) -> [u8; 4] {
     if sampled == 0 {
         return [255, 255, 255, 255];
     }
-    // Ties go to the darker bucket, so the choice is deterministic.
+    // Ties go to the lowest bucket index, so the choice is deterministic.
+    // Bucket order is by channel nibble, not by luminance, so "lowest index"
+    // is not "darkest": it is a tie-break, nothing more.
     let mut winner = 0;
     for (index, counts) in buckets.iter().enumerate() {
         if counts[0] > buckets[winner][0] {

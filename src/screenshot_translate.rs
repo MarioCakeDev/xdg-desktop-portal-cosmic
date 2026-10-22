@@ -92,6 +92,9 @@ pub struct Translated {
     pub kept: usize,
     /// Lines the engine returned non-empty text for.
     pub translated: usize,
+    /// Lines the opposite-polarity pass recovered from a block the crop's own
+    /// polarity had folded into the background.
+    pub recovered: usize,
     /// Lines left exactly as they were because they are code, not prose.
     pub skipped_code: usize,
     /// The capture was already in the target language; nothing was painted.
@@ -218,6 +221,7 @@ fn translate_with(
         found: applied.found,
         kept: applied.kept,
         translated: applied.translated,
+        recovered: applied.recovered,
         skipped_code: applied.skipped_code,
         same_language: applied.same_language,
         debug_dir: applied.debug_dir,
@@ -359,6 +363,7 @@ mod tests {
             found: 1,
             kept: 1,
             translated: 1,
+            recovered: 0,
             skipped_code: 0,
             same_language: false,
             debug_dir: None,
