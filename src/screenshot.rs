@@ -1385,15 +1385,17 @@ mod tests {
         let mut portal = test_portal(handler.clone());
         let _ = update_msg(&mut portal, Msg::TargetLanguage(german()));
 
-        // Exactly what `Msg::Choice`/`Msg::Location` hand to
-        // `ConfigSetScreenshot`: the whole struct, rebuilt from the in-memory
-        // copy. A stale copy would resurrect `None` here.
+        // Exactly what `Msg::Choice`/`Msg::Location` hand to the runtime: the
+        // whole struct, rebuilt from the in-memory copy, through the same
+        // `Msg::ConfigSetScreenshot` arm they use. A stale copy would resurrect
+        // `None` here.
+        use cosmic::Application as _;
         let save = config::screenshot::Screenshot {
             choice: config::screenshot::Choice::Rectangle,
             last_rectangle: portal.config.screenshot.last_rectangle,
             ..portal.config.screenshot.clone()
         };
-        portal.save_screenshot_config(save);
+        let _ = portal.update(crate::app::Msg::ConfigSetScreenshot(save));
 
         let stored = reload(&handler).screenshot;
         assert_eq!(stored.target_language.as_deref(), Some("de"));

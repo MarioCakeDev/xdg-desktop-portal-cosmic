@@ -59,8 +59,10 @@ impl CosmicPortal {
     /// the file when the value differs from `self.config.screenshot`, so the
     /// in-memory copy must not be updated before this call: doing that turns
     /// the save into a silent no-op (the language pick used to disappear that
-    /// way). On success the setter installs `screenshot` as the new in-memory
-    /// value, so a later Choice/Location save keeps it.
+    /// way). On a change the setter installs `screenshot` as the new in-memory
+    /// value before attempting the write, so a later Choice/Location save keeps
+    /// it; after a failed write memory is ahead of the file, and the next
+    /// full-struct save heals it.
     pub(crate) fn save_screenshot_config(&mut self, screenshot: config::screenshot::Screenshot) {
         match &mut self.config_handler {
             Some(handler) => {
