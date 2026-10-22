@@ -10,14 +10,13 @@ These four crates are copied from the cosmic-screenshot fork:
 | `cosmic-screenshot-engine` | `crates/engine` |
 
 - Repository: <https://github.com/MarioCakeDev/cosmic-screenshot>
-- Commit: `2cfd13e3f3e091264cce31078a6f197c278826cd`
-  (one commit after `c89de94`, on top of upstream `1.11.0`): screenshot OCR
-  (probe → narrow, psm 11/6/12, 2× enlargement), the honest
-  found/kept/translated/drawn counts and the `COSMIC_SCREENSHOT_DEBUG_DIR`
-  dump.
+- Commit: `a5b72d6513c4d38b015053b55874d1b0f1f3dff7`
+  — binarised screenshot OCR (probe → narrow, one psm 6 pass, psm 11 only for
+  a short reading), the honest found/kept/translated/drawn counts and the
+  `COSMIC_SCREENSHOT_DEBUG_DIR` dump.
 
-Each `src/lib.rs` carries a three-line header naming that commit. Apart from the
-header the files are byte-identical to the source.
+Each `src/lib.rs` carries a five-line provenance header naming that commit.
+Apart from the header the files are byte-identical to the source.
 
 ## Why vendored, not a git dependency
 
@@ -39,9 +38,10 @@ screenshot dialog both call `engine::translate_canvas`.
 ## Refreshing
 
 ```sh
-contrib/sync-engine.sh /path/to/cosmic-screenshot
+./contrib/sync-engine.sh /path/to/cosmic-screenshot
 ```
 
-The script copies the four crates, rewrites the headers, and updates this file
-with the new commit. Do not edit the vendored crates here; change them in the
-source repository first.
+The script lives in this repository (`contrib/sync-engine.sh`). It copies the
+four crates, rewrites the headers, and updates this file with the new commit.
+Do not edit the vendored crates here; change them in the source repository
+first.

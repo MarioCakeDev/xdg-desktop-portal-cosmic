@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 9865c731661914eea056d2fda4ef3db1cc50f52e (crates/overlay).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a5b72d6513c4d38b015053b55874d1b0f1f3dff7 (crates/overlay).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! Paint translated text over the original glyphs, in place.

@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 9865c731661914eea056d2fda4ef3db1cc50f52e (crates/engine).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a5b72d6513c4d38b015053b55874d1b0f1f3dff7 (crates/engine).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! The translate-the-capture pipeline: OCR, auto-detect, translate, overlay.
@@ -281,8 +281,9 @@ pub fn main_languages(detected: Lang) -> String {
 }
 
 /// OCR the capture: a cheap English probe names the language, then the main
-/// pass reads with that language's packs. Falls back to every pack when the
-/// probe cannot be trusted, keeping whichever reading is better.
+/// pass reads with that language's packs. Falls back to every pack only when
+/// the English pass kept fewer than two lines or read no Latin text, keeping
+/// whichever reading is better.
 fn recognize_blocks(
     request: &Request,
     translator: &dyn Translator,
@@ -312,16 +313,14 @@ fn recognize_blocks(
     ));
 
     let source = trusted_detection(&probe, translator);
-    trace.push(match source {
-        Some(lang) => format!(
-            "detected: {} ({})",
-            lang.english_name(),
-            main_languages(lang)
-        ),
-        None => "detected: nothing trustworthy; keeping every pack as a fallback".to_string(),
-    });
 
-    let Some(source) = source else {
+    // The 24-pack read is ~10x the cost of the binarised English pass, so it is
+    // kept for the one case the probe cannot serve: a capture whose script the
+    // English model cannot read at all. Low confidence on Latin text is not
+    // that case — the probe's lines are still worth translating, and the
+    // translator detects the source again when it is handed `None`.
+    if source.is_none() && needs_every_pack(&probe) {
+        trace.push("detected: nothing trustworthy; reading with every pack".to_string());
         // Mixed or non-Latin capture: read every pack, then keep the better of
         // the two readings. The probe is never worse than the old first pass
         // because it is judged on the same score.
@@ -348,7 +347,20 @@ fn recognize_blocks(
             chosen.kept()
         ));
         return Ok((chosen, None, trace));
+    }
+
+    let Some(source) = source else {
+        trace.push(format!(
+            "detected: nothing trustworthy; keeping the probe ({} credible lines, no full-pack read)",
+            probe.kept()
+        ));
+        return Ok((probe, None, trace));
     };
+    trace.push(format!(
+        "detected: {} ({})",
+        source.english_name(),
+        main_languages(source)
+    ));
 
     let languages = main_languages(source);
     if languages == PROBE_LANGUAGES {
@@ -396,6 +408,14 @@ fn trusted_detection(probe: &ocr::Reading, translator: &dyn Translator) -> Optio
         })) => Some(lang),
         _ => None,
     }
+}
+
+/// Does this probe justify the 24-pack read? Only when the English pass kept
+/// too little to translate, or read no Latin text at all — a genuinely
+/// non-Latin capture. A low-confidence but readable Latin probe is used as-is:
+/// the translator detects the language again from its text.
+fn needs_every_pack(probe: &ocr::Reading) -> bool {
+    probe.kept() < PROBE_MIN_LINES || !mostly_latin(&probe.texts())
 }
 
 /// Is the probe's text letter-based and overwhelmingly Latin? A CJK or Cyrillic
@@ -638,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn an_assumed_detection_does_not_narrow_the_packs() {
+    fn an_assumed_detection_keeps_the_probe_without_a_full_read() {
         let request = request();
         let translator = FakeTranslator::new("").assuming_the_source_on_detection("en");
 
@@ -646,13 +666,54 @@ mod tests {
             &request,
             &translator,
             vec![
-                reading("eng", 11, &["Hello there", "Options"]),
-                reading("eng", 11, &["Hello there", "Options"]),
-                reading(&lang::all_ocr_languages(), 11, &["Hello there", "Options"]),
+                reading("eng", 6, &["Hello there", "Options"]),
+                reading(&lang::all_ocr_languages(), 6, &["Hello there", "Options"]),
             ],
         );
 
-        assert_eq!(configs.last().unwrap(), &lang::all_ocr_languages());
+        assert_eq!(
+            configs,
+            vec!["eng".to_string()],
+            "readable Latin text must not pay for the 24-pack read"
+        );
+        assert_eq!(source, None, "the sidecar detects again when translating");
+    }
+
+    #[test]
+    fn a_low_confidence_latin_probe_is_translated_as_read() {
+        let request = request();
+        let translator = FakeTranslator::new("").with_detection("en");
+        let mut dim = reading("eng", 6, &["Game Menu", "Back to Game"]);
+        for block in &mut dim.blocks {
+            block.confidence = 40.0;
+        }
+
+        let (blocks, source, configs) = passes(&request, &translator, vec![dim]);
+
+        assert_eq!(configs, vec!["eng".to_string()]);
+        assert_eq!(source, None);
+        assert_eq!(blocks.len(), 2, "the probe's text is still usable");
+    }
+
+    #[test]
+    fn a_non_latin_probe_still_reads_every_pack() {
+        let request = request();
+        let translator = FakeTranslator::new("").with_detection("de");
+
+        let (_, source, configs) = passes(
+            &request,
+            &translator,
+            vec![
+                reading("eng", 6, &["Меню", "Назад в игру"]),
+                reading(
+                    &lang::all_ocr_languages(),
+                    6,
+                    &["Меню", "Назад в игру", "Опции"],
+                ),
+            ],
+        );
+
+        assert_eq!(configs[1], lang::all_ocr_languages());
         assert_eq!(source, None);
     }
 

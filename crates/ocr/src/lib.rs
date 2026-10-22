@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 2cfd13e3f3e091264cce31078a6f197c278826cd (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a5b72d6513c4d38b015053b55874d1b0f1f3dff7 (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -10,14 +10,16 @@
 //! keeps a misbehaving OCR run from taking the UI with it. The TSV parser is
 //! pure so it is tested against fixtures.
 //!
-//! A screenshot is not a document. The defaults are tuned for one: lines are
-//! found with the sparse-text page segmentation mode (11), the uniform-block
-//! mode (6) and sparse text with orientation detection (12) — whichever keeps
-//! the most credible text; the crop is enlarged before recognition, because
+//! A screenshot is not a document. The defaults are tuned for one: the crop is
+//! binarised before recognition (grey, histogram stretch, hard threshold),
+//! because game UI is anti-aliased light text on a dark panel and Tesseract
+//! reads the soft edges as strokes — `Advancements` comes back as
+//! `AYancernrentS` on the raw pixels; the crop is then enlarged, because
 //! Tesseract wants roughly 30 px tall glyphs and a 20 px menu label is below
-//! that; and a line made mostly of punctuation is dropped instead of being
-//! handed to the translator. Nothing here invents text: every block comes from
-//! a Tesseract pass over the pixels.
+//! that; one uniform-block pass (6) reads it, with a sparse-text pass (11) only
+//! when that keeps fewer than two lines; and a line made mostly of punctuation
+//! is dropped instead of being handed to the translator. Nothing here invents
+//! text: every block comes from a Tesseract pass over the pixels.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -40,23 +42,38 @@ pub const LANGUAGES_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_LANGS";
 /// subdirectory there.
 pub const DEBUG_DIR_VARIABLE: &str = "COSMIC_SCREENSHOT_DEBUG_DIR";
 
-/// Pin one page segmentation mode instead of the built-in pair. Mostly for
-/// tuning against a capture: the pipeline otherwise picks per image.
+/// Pin one page segmentation mode instead of the built-in default and its
+/// short-read fallback. Mostly for tuning against a capture.
 pub const PSM_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_PSM";
 
 /// Enlargement factor applied before recognition (`1` disables it).
 pub const SCALE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_SCALE";
 
+/// Set to `0`/`false`/`off` to hand Tesseract the greyscale crop instead of a
+/// binarised one. On by default: binarisation is what makes a game menu
+/// readable at all.
+pub const BINARIZE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_BINARIZE";
+
+/// Luma split point for the binarised crop (`1`–`254`). Raise it for a dim
+/// capture, lower it when panel shading bleeds into the glyphs.
+pub const THRESHOLD_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_THRESHOLD";
+
+/// Light UI text on a dark panel separates cleanly at 150.
+pub const DEFAULT_THRESHOLD: u8 = 150;
+
 /// Below this mean word confidence a line is dropped.
 pub const DEFAULT_MIN_CONFIDENCE: f32 = 30.0;
 
-/// Screenshot defaults: sparse text first, uniform block second, then sparse
-/// text with orientation detection. The first pass that reads a full menu
-/// confidently ends the search; otherwise all three are compared.
-const DEFAULT_PSMS: [u8; 3] = [11, 6, 12];
+/// Screenshot default: one uniform-block pass (psm 6). On a binarised menu it
+/// reads the labels in ~300 ms; a tournament of page segmentation modes costs
+/// six seconds and reads no better.
+const DEFAULT_PSM: u8 = 6;
 
-/// Only tried when the screenshot modes find nothing at all.
-const FALLBACK_PSMS: [u8; 1] = [3];
+/// Only tried when the default pass keeps fewer than two lines.
+const FALLBACK_PSMS: [u8; 1] = [11];
+
+/// Fewer kept lines than this is not a reading worth trusting.
+const FALLBACK_BELOW_LINES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bbox {
@@ -225,12 +242,18 @@ pub struct Config {
     pub binary: PathBuf,
     /// Tesseract `-l` value, e.g. `eng+deu`.
     pub languages: String,
-    /// A pinned page segmentation mode; `None` tries the screenshot pair and
-    /// keeps the better reading.
+    /// A pinned page segmentation mode; `None` runs the screenshot default and
+    /// its single short-read fallback.
     pub psm: Option<u8>,
     /// Enlargement before recognition. Tesseract is happiest around 30 px cap
     /// height; ordinary game UI is not.
     pub scale: u32,
+    /// Greyscale, stretch the histogram, then split at [`Config::threshold`]
+    /// before recognition. The same crop that reads `AYancernrentS` raw reads
+    /// `Advancements` binarised, at a twentieth of the cost of extra passes.
+    pub binarize: bool,
+    /// Luma split point for [`Config::binarize`], `1..=254`.
+    pub threshold: u8,
     /// Lines below this mean confidence are dropped.
     pub min_confidence: f32,
     /// When set, write the OCR input and the raw TSV under this directory.
@@ -244,6 +267,8 @@ impl Default for Config {
             languages: ALL_LANGUAGES.to_string(),
             psm: None,
             scale: 2,
+            binarize: true,
+            threshold: DEFAULT_THRESHOLD,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             debug: None,
         }
@@ -273,6 +298,19 @@ impl Config {
         {
             config.scale = scale;
         }
+        if let Some(binarize) = std::env::var(BINARIZE_VARIABLE)
+            .ok()
+            .and_then(|value| parse_switch(&value))
+        {
+            config.binarize = binarize;
+        }
+        if let Some(threshold) = std::env::var(THRESHOLD_VARIABLE)
+            .ok()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|threshold| (1..=254).contains(threshold))
+        {
+            config.threshold = threshold;
+        }
         if let Some(debug) = Debug::from_env() {
             config.debug = Some(debug);
         }
@@ -289,9 +327,30 @@ impl Config {
         self
     }
 
+    pub fn with_binarize(mut self, binarize: bool) -> Self {
+        self.binarize = binarize;
+        self
+    }
+
+    pub fn with_threshold(mut self, threshold: u8) -> Self {
+        self.threshold = threshold.clamp(1, 254);
+        self
+    }
+
     pub fn with_debug(mut self, debug: Option<Debug>) -> Self {
         self.debug = debug;
         self
+    }
+}
+
+/// `1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no` — anything else is ignored
+/// so a typo leaves the default in place rather than silently disabling the
+/// step that makes the crop readable.
+fn parse_switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -343,13 +402,13 @@ pub fn recognize(image: &Path, config: &Config) -> Result<Vec<TextBlock>, OcrErr
     recognize_reading(image, config).map(|reading| reading.blocks)
 }
 
-/// Read `image`, trying the screenshot page segmentation modes and keeping the
-/// most credible reading.
+/// Read `image`, running the screenshot page segmentation mode and, only when
+/// that keeps too little, the sparse-text fallback.
 pub fn recognize_reading(image: &Path, config: &Config) -> Result<Reading, OcrError> {
-    let prepared = Prepared::open(image, config.scale)?;
+    let prepared = Prepared::open(image, config)?;
     let candidates: Vec<u8> = match config.psm {
         Some(psm) => vec![psm],
-        None => DEFAULT_PSMS.to_vec(),
+        None => vec![DEFAULT_PSM],
     };
     let mut attempts: Vec<Reading> = Vec::new();
     let mut first_error = None;
@@ -365,7 +424,8 @@ pub fn recognize_reading(image: &Path, config: &Config) -> Result<Reading, OcrEr
             }
         }
     }
-    if config.psm.is_none() && attempts.iter().all(|reading| reading.blocks.is_empty()) {
+    let kept: usize = attempts.iter().map(Reading::kept).sum();
+    if config.psm.is_none() && kept < FALLBACK_BELOW_LINES {
         for psm in FALLBACK_PSMS {
             if let Ok(reading) = run_pass(&prepared, config, psm) {
                 attempts.push(reading);
@@ -437,30 +497,46 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn open(image: &Path, scale: u32) -> Result<Self, OcrError> {
-        let scale = scale.max(1);
-        if scale == 1 {
+    fn open(image: &Path, config: &Config) -> Result<Self, OcrError> {
+        let scale = config.scale.max(1);
+        let opened = image::open(image).map_err(|error| OcrError::Image(error.to_string()))?;
+        let (width, height) = (opened.width(), opened.height());
+        if scale == 1 && !config.binarize {
             // Still decode once: it validates the capture before Tesseract is
             // asked to, and gives the dump its dimensions.
-            let opened = image::open(image).map_err(|error| OcrError::Image(error.to_string()))?;
             return Ok(Self {
                 path: image.to_path_buf(),
                 _temp: None,
-                width: opened.width(),
-                height: opened.height(),
+                width,
+                height,
                 scale,
             });
         }
 
-        let opened = image::open(image).map_err(|error| OcrError::Image(error.to_string()))?;
-        let (width, height) = (opened.width(), opened.height());
-        let enlarged = opened.resize_exact(width * scale, height * scale, FilterType::Lanczos3);
+        let prepared = if scale > 1 {
+            opened.resize_exact(width * scale, height * scale, FilterType::Lanczos3)
+        } else {
+            opened
+        };
+        let prepared = if config.binarize {
+            // Game UI is anti-aliased light text on a dark panel. Greyscale,
+            // stretch the histogram so a dim capture still uses the full range,
+            // then split hard: Tesseract reads the edges of soft glyphs as
+            // strokes and returns `AYancernrentS` for `Advancements`.
+            let mut luma = prepared.to_luma8();
+            autocontrast(&mut luma);
+            split_at(&mut luma, config.threshold);
+            image::DynamicImage::ImageLuma8(luma)
+        } else {
+            prepared
+        };
+
         let mut temp = tempfile::Builder::new()
             .prefix("cosmic-screenshot-ocr-")
             .suffix(".png")
             .tempfile()
             .map_err(|error| OcrError::Image(error.to_string()))?;
-        enlarged
+        prepared
             .write_to(temp.as_file_mut(), image::ImageFormat::Png)
             .map_err(|error| OcrError::Image(error.to_string()))?;
         Ok(Self {
@@ -470,6 +546,41 @@ impl Prepared {
             height,
             scale,
         })
+    }
+}
+
+/// Stretch the luma histogram to the full 0–255 range, so the threshold sees a
+/// dim capture with the same contrast as a bright one.
+fn autocontrast(image: &mut image::GrayImage) {
+    let mut histogram = [0u32; 256];
+    for pixel in image.pixels() {
+        histogram[pixel.0[0] as usize] += 1;
+    }
+    let (Some(low), Some(high)) = (
+        histogram.iter().position(|count| *count > 0),
+        histogram.iter().rposition(|count| *count > 0),
+    ) else {
+        return;
+    };
+    if high <= low {
+        return;
+    }
+    let span = (high - low) as f32;
+    let mut lut = [0u8; 256];
+    for (value, mapped) in lut.iter_mut().enumerate() {
+        *mapped = ((value.saturating_sub(low) as f32 / span) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    for pixel in image.pixels_mut() {
+        pixel.0[0] = lut[pixel.0[0] as usize];
+    }
+}
+
+/// Hard split: at or above the threshold is paper, below it is ink.
+fn split_at(image: &mut image::GrayImage, threshold: u8) {
+    for pixel in image.pixels_mut() {
+        pixel.0[0] = if pixel.0[0] >= threshold { 255 } else { 0 };
     }
 }
 
@@ -546,9 +657,14 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
             tsv.as_bytes(),
         ));
         let summary = format!(
-            "languages: {}\npsm: {psm}\nscale: {}\ninput: {}x{} (enlarged {}x{})\nfound: {}\nkept: {}\ndropped (confidence < {}): {}\ndropped (unreadable): {}\nelapsed: {} ms\n",
+            "languages: {}\npsm: {psm}\nscale: {}\npreprocess: {}\ninput: {}x{} (enlarged {}x{})\nfound: {}\nkept: {}\ndropped (confidence < {}): {}\ndropped (unreadable): {}\nelapsed: {} ms\n",
             config.languages,
             prepared.scale,
+            if config.binarize {
+                format!("binarised at {}", config.threshold)
+            } else {
+                "greyscale, no binarisation".to_string()
+            },
             prepared.width,
             prepared.height,
             prepared.width * prepared.scale,
@@ -904,6 +1020,89 @@ mod tests {
         let config = Config::from_env();
         assert_eq!(config.scale, 2, "out of range values keep the default");
         assert_eq!(config.psm, None);
+    }
+
+    #[test]
+    fn autocontrast_stretches_the_histogram_before_the_split() {
+        let mut image = image::GrayImage::from_raw(4, 1, vec![100, 120, 140, 160]).expect("image");
+        autocontrast(&mut image);
+        let stretched: Vec<u8> = image.pixels().map(|pixel| pixel.0[0]).collect();
+        assert_eq!(stretched, vec![0, 85, 170, 255]);
+
+        split_at(&mut image, DEFAULT_THRESHOLD);
+        let split: Vec<u8> = image.pixels().map(|pixel| pixel.0[0]).collect();
+        assert_eq!(split, vec![0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_flat_image_survives_autocontrast_unchanged() {
+        let mut image = image::GrayImage::from_raw(2, 1, vec![128, 128]).expect("image");
+        autocontrast(&mut image);
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+            vec![128, 128]
+        );
+    }
+
+    #[test]
+    fn the_prepared_crop_is_binarised_and_enlarged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let image = dir.path().join("panel.png");
+        // Light glyph on a dark panel, like a menu label.
+        image::RgbaImage::from_raw(2, 1, vec![40, 40, 40, 255, 220, 220, 220, 255])
+            .expect("image")
+            .save(&image)
+            .expect("write test image");
+
+        let prepared = Prepared::open(&image, &Config::default()).expect("prepare");
+        assert_eq!((prepared.width, prepared.height, prepared.scale), (2, 1, 2));
+        let opened = image::open(&prepared.path).expect("read prepared");
+        assert_eq!((opened.width(), opened.height()), (4, 2));
+        let luma = opened.to_luma8();
+        assert!(
+            luma.pixels()
+                .all(|pixel| pixel.0[0] == 0 || pixel.0[0] == 255),
+            "every pixel handed to Tesseract must be one side of the threshold"
+        );
+        assert!(
+            luma.pixels().any(|pixel| pixel.0[0] == 255),
+            "the light glyph must survive the threshold"
+        );
+    }
+
+    #[test]
+    fn preprocessing_can_be_disabled_and_the_threshold_tuned() {
+        unsafe {
+            std::env::set_var(BINARIZE_VARIABLE, "off");
+            std::env::set_var(THRESHOLD_VARIABLE, "170");
+        }
+        let config = Config::from_env();
+        assert!(!config.binarize);
+        assert_eq!(config.threshold, 170);
+        unsafe {
+            std::env::set_var(BINARIZE_VARIABLE, "maybe");
+            std::env::set_var(THRESHOLD_VARIABLE, "300");
+        }
+        let config = Config::from_env();
+        assert!(config.binarize, "an unparseable switch keeps the default");
+        assert_eq!(config.threshold, DEFAULT_THRESHOLD);
+        unsafe {
+            std::env::remove_var(BINARIZE_VARIABLE);
+            std::env::remove_var(THRESHOLD_VARIABLE);
+        }
+    }
+
+    #[test]
+    fn no_preprocessing_at_scale_one_hands_over_the_original_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let image = dir.path().join("shot.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]))
+            .save(&image)
+            .expect("write test image");
+        let config = Config::default().with_binarize(false);
+        let prepared = Prepared::open(&image, &Config { scale: 1, ..config }).expect("prepare");
+        assert_eq!(prepared.path, image);
+        assert!(prepared._temp.is_none());
     }
 
     #[test]
