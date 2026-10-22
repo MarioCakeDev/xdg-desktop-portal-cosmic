@@ -10,6 +10,7 @@
 //! `cosmic-screenshot-engine`, vendored from the cosmic-screenshot fork (see
 //! `crates/VENDORED.md`). This file only knows about rectangles and pixels.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cosmic_screenshot_engine::{self as engine, lang};
@@ -83,9 +84,18 @@ pub struct Translated {
     pub target: &'static lang::LangInfo,
     /// "German", or "English (assumed)" when detection was not confident.
     pub source: String,
-    /// OCR lines handed to the renderer, and how many were actually drawn.
-    pub lines: usize,
+    /// Credible OCR lines handed to the renderer, and how many were actually
+    /// drawn.
     pub drawn: usize,
+    /// Lines Tesseract emitted, and how many survived the credibility filter.
+    pub found: usize,
+    pub kept: usize,
+    /// Lines the engine returned non-empty text for.
+    pub translated: usize,
+    /// The capture was already in the target language; nothing was painted.
+    pub same_language: bool,
+    /// The opt-in `COSMIC_SCREENSHOT_DEBUG_DIR` run directory, when enabled.
+    pub debug_dir: Option<PathBuf>,
 }
 
 /// Where a selection sits inside one output's captured pixels.
@@ -189,7 +199,7 @@ fn translate_with(
     );
     let mut canvas = Canvas::new(cropped.width(), cropped.height(), cropped.into_raw());
     let applied = engine::translate_canvas(&mut canvas, &request, translator, &|config| {
-        ocr::recognize(file.path(), config)
+        ocr::recognize_reading(file.path(), config)
     })
     .map_err(|error| error.to_string())?;
 
@@ -202,8 +212,12 @@ fn translate_with(
         image: Arc::new(image),
         target,
         source: applied.source_label(),
-        lines: applied.blocks,
         drawn: applied.report.drawn,
+        found: applied.found,
+        kept: applied.kept,
+        translated: applied.translated,
+        same_language: applied.same_language,
+        debug_dir: applied.debug_dir,
     })
 }
 
@@ -269,7 +283,11 @@ mod tests {
     #[test]
     fn a_selection_on_another_output_has_no_region() {
         assert_eq!(
-            region_for_selection(rect(0, 0, 100, 100), rect(1920, 0, 3840, 1080), (1920, 1080)),
+            region_for_selection(
+                rect(0, 0, 100, 100),
+                rect(1920, 0, 3840, 1080),
+                (1920, 1080)
+            ),
             None
         );
     }
@@ -336,6 +354,11 @@ mod tests {
             source: "English".into(),
             lines: 1,
             drawn: 1,
+            found: 1,
+            kept: 1,
+            translated: 1,
+            same_language: false,
+            debug_dir: None,
         };
 
         let out = composite(&base, &translated);
@@ -373,8 +396,15 @@ mod tests {
             std::env::remove_var("COSMIC_SCREENSHOT_NLLB_URL");
         }
 
-        assert!(error.starts_with("translation engine not available:"), "{error}");
-        assert_eq!(error.lines().count(), 1, "the dialog shows exactly one line");
+        assert!(
+            error.starts_with("translation engine not available:"),
+            "{error}"
+        );
+        assert_eq!(
+            error.lines().count(),
+            1,
+            "the dialog shows exactly one line"
+        );
         assert_eq!(
             source,
             RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255])),
@@ -386,8 +416,8 @@ mod tests {
     /// engine paints with, so the test needs no binary fixture.
     fn text_capture() -> Option<RgbaImage> {
         use cosmic_screenshot_overlay::{
-            overlay as paint, FontSet, Options as OverlayOptions, Rect as OverlayRect, Script,
-            TranslatedBlock,
+            FontSet, Options as OverlayOptions, Rect as OverlayRect, Script, TranslatedBlock,
+            overlay as paint,
         };
 
         let fonts = FontSet::system(Script::Latin).ok()?;
@@ -436,8 +466,8 @@ mod tests {
             "Tesseract reads the drawn line: {:?}",
             calls[0].texts
         );
-        assert!(done.lines >= 1);
-        assert_eq!(done.drawn, done.lines, "every line is repainted");
+        assert!(done.kept >= 1);
+        assert_eq!(done.drawn, done.kept, "every line is repainted");
         assert_eq!(done.region, Region::whole(source.dimensions()));
 
         let composited = composite(&source, &done);

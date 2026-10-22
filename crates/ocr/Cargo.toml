@@ -6,3 +6,6 @@ description = "Thin Tesseract CLI wrapper that yields text blocks with bounding 
 license = "GPL-3.0-only"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3"
+

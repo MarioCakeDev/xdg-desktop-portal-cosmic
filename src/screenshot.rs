@@ -1080,6 +1080,11 @@ pub fn update_msg(
                     // Composite first, then swap the buffer: the dialog never
                     // shows or exports a half-painted image.
                     let composited = translate::composite(base, &done);
+                    // Opt-in ground truth: the full capture as the dialog
+                    // would export it, beside the OCR dumps of the same run.
+                    if let Some(dir) = &done.debug_dir {
+                        let _ = composited.save(dir.join("composite.png"));
+                    }
                     let (width, height) = composited.dimensions();
                     let handle = cosmic::widget::image::Handle::from_rgba(
                         width,
@@ -1093,15 +1098,32 @@ pub fn update_msg(
                             handle,
                         },
                     );
-                    args.status = Some(if done.drawn == done.lines {
+                    // Counts, not a verdict: one line translated out of ten
+                    // must not read as a success, and a run that painted
+                    // nothing says why.
+                    args.status = Some(if done.same_language {
                         format!(
-                            "{} → {} · {} line(s)",
-                            done.source, done.target.name, done.drawn
+                            "this looks like {} already — pick another target language in the toolbar",
+                            done.target.name
                         )
+                    } else if done.kept == 0 {
+                        if done.found == 0 {
+                            "no text found in the selected area — nothing to translate".to_string()
+                        } else {
+                            format!(
+                                "found {} line(s) but none readable — nothing translated",
+                                done.found
+                            )
+                        }
                     } else {
                         format!(
-                            "{} → {} · {} of {} line(s) drawn",
-                            done.source, done.target.name, done.drawn, done.lines
+                            "{} → {} · found {}, kept {}, translated {}, drawn {}",
+                            done.source,
+                            done.target.name,
+                            done.found,
+                            done.kept,
+                            done.translated,
+                            done.drawn
                         )
                     });
                 }
