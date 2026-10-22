@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 3316fb9af624f821d4e7e4e5957dcb202b196d40 (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 3b7ff2f5b6544da58ab0ab1d4ab1c523c8313ceb (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -926,7 +926,9 @@ pub fn parse_tsv_with(tsv: &str, spellfix: bool) -> (Vec<TextBlock>, Vec<Correct
 /// A gap wider than twice the line's median word gap starts a new block; a gap
 /// wider than 1.2 line heights always does, so two words on opposite sides of a
 /// wide button are never painted as one. When a line has fewer than two gaps
-/// (one or two words) there is no local median, so the page median is used.
+/// (one or two words) there is no local median, so the page median is used,
+/// capped at half the line height: on a page of two-column rows the page median
+/// is the column gap itself, and 2× it would otherwise outvote the height floor.
 fn cluster_line(words: &[Word], global_gap: Option<u32>) -> Vec<Vec<&Word>> {
     if words.is_empty() {
         return Vec::new();
@@ -937,15 +939,17 @@ fn cluster_line(words: &[Word], global_gap: Option<u32>) -> Vec<Vec<&Word>> {
         .collect();
     let height = median_value(words.iter().map(|word| word.bbox.height)).unwrap_or(1);
     let basis = if gaps.len() >= 2 {
+        // The line's own word spacing: 2× this is the split point, so a label
+        // whose words are widely spaced stays one block (its median is wide
+        // too). The lower median keeps one column gap from setting the pace.
         median_value(gaps.iter().copied())
     } else {
-        global_gap
+        // A page whose rows are mostly two columns has a page median that *is*
+        // the column gap. Cap only this borrowed median at half the line
+        // height, so 2×basis cannot outvote the 1.2×height floor.
+        global_gap.map(|gap| gap.min(height / 2))
     }
     .unwrap_or(height / 2)
-    // A page whose rows are mostly two columns has a median gap that *is* the
-    // column gap. Capping the basis below the height floor keeps 2×basis from
-    // outvoting 1.2×height and merging those rows.
-    .min(height / 2)
     .max(1);
     let split = ((basis as f32 * 2.0).max(height as f32 * 1.2)).round() as u32;
 
@@ -1135,6 +1139,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Advancements", "Statistics", "Advancements", "Statistics"]
         );
+    }
+
+    #[test]
+    fn widely_spaced_words_of_one_label_stay_one_block() {
+        // A pixel font can put 240 px between words on a 198 px line; the line's
+        // own median gap is that wide, so 2×median keeps `Back to Game` whole.
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   5\t1\t1\t1\t1\t1\t0\t0\t100\t198\t85\tBack\n\
+                   5\t1\t1\t1\t1\t2\t340\t0\t90\t198\t91\tto\n\
+                   5\t1\t1\t1\t1\t3\t670\t0\t120\t198\t87\tGame\n";
+        let blocks = parse_tsv(tsv);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].text, "Back to Game");
     }
 
     #[test]

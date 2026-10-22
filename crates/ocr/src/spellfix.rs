@@ -17,9 +17,10 @@
 //! when the corrector fired.
 //!
 //! The corrector is also **English-gated**: it only runs on a line that already
-//! contains an exact vocabulary word. A German line (`Musik`, `Menü`,
-//! `Optionen`) has no such anchor, so its real words are never rewritten into
-//! English look-alikes.
+//! contains an exact vocabulary word that is not shared with German (`OK`,
+//! `Sound`, `Video`, `Feedback`, `Credits`, `Mods` do not count). A German line
+//! (`Musik`, `Menü`, `Optionen`) has no such anchor, so its real words are never
+//! rewritten into English look-alikes.
 
 /// A token the corrector replaced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +83,12 @@ const PHRASES: &[(&str, &str)] = &[
     ("report", "bugs"),
 ];
 
+/// Vocabulary words that are also ordinary German (or otherwise shared) words,
+/// so their presence does not prove the line is English. `game` stays an anchor:
+/// the owner's `Gack to Game` depends on it, and it is a loanword rather than a
+/// native German label.
+const AMBIGUOUS_ANCHORS: [&str; 6] = ["ok", "sound", "video", "feedback", "credits", "mods"];
+
 /// Tokens shorter than this are never corrected: `zu`, `to`, `OK` are real
 /// words in one source language or another, and one edit would rewrite them.
 const MIN_LENGTH: usize = 4;
@@ -99,9 +106,11 @@ pub fn correct_line(tokens: &[&str]) -> (Vec<String>, Vec<Correction>) {
 
     // English-gate: a line with no exact UI word is probably not English, and
     // rewriting `Musik` or `Menü` into an English look-alike would be wrong.
+    // Words that are also German (`OK`, `Sound`, `Video`, …) cannot prove the
+    // line is English and are not anchors.
     let anchored = tokens.iter().any(|token| {
         let lower = token.to_lowercase();
-        UI_WORDS.contains(&lower.as_str())
+        UI_WORDS.contains(&lower.as_str()) && !AMBIGUOUS_ANCHORS.contains(&lower.as_str())
     });
     if !anchored {
         return (corrected, corrections);
@@ -251,11 +260,15 @@ mod tests {
     #[test]
     fn a_line_without_an_english_anchor_is_left_alone() {
         // Real words in other languages must not be rewritten into English
-        // look-alikes; none of these lines contains an exact UI word.
+        // look-alikes; none of these lines contains an unambiguous English word.
         assert_eq!(corrected(&["Musik", "Lautstärke"]), ["Musik", "Lautstärke"]);
         assert_eq!(corrected(&["Menü", "Optionen"]), ["Menü", "Optionen"]);
         assert_eq!(corrected(&["Musica"]), ["Musica"]);
         assert_eq!(corrected(&["Disconect"]), ["Disconect"]);
+        // These words exist in German too, so they are not anchors.
+        assert_eq!(corrected(&["OK", "Menü"]), ["OK", "Menü"]);
+        assert_eq!(corrected(&["Sound", "Musik"]), ["Sound", "Musik"]);
+        assert_eq!(corrected(&["Video", "Musik"]), ["Video", "Musik"]);
     }
 
     #[test]
