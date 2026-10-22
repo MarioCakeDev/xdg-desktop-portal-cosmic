@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 9865c731661914eea056d2fda4ef3db1cc50f52e (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 2cfd13e3f3e091264cce31078a6f197c278826cd (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -532,11 +532,19 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
     };
 
     if let Some(debug) = &config.debug {
+        // Diagnostics must never fail a capture the user asked for: a full
+        // disk loses the dump, not the translation.
         let stem = format!("psm{psm}");
-        let crop = debug.path(&format!("{stem}-crop.png"));
-        std::fs::copy(&prepared.path, &crop).map_err(|error| OcrError::Image(error.to_string()))?;
-        std::fs::write(debug.path(&format!("{stem}.tsv")), tsv.as_bytes())
-            .map_err(|error| OcrError::Image(error.to_string()))?;
+        let note = |result: Result<(), std::io::Error>| {
+            if let Err(error) = result {
+                eprintln!("cosmic-screenshot: could not write the OCR debug dump: {error}");
+            }
+        };
+        note(std::fs::copy(&prepared.path, debug.path(&format!("{stem}-crop.png"))).map(|_| ()));
+        note(std::fs::write(
+            debug.path(&format!("{stem}.tsv")),
+            tsv.as_bytes(),
+        ));
         let summary = format!(
             "languages: {}\npsm: {psm}\nscale: {}\ninput: {}x{} (enlarged {}x{})\nfound: {}\nkept: {}\ndropped (confidence < {}): {}\ndropped (unreadable): {}\nelapsed: {} ms\n",
             config.languages,
@@ -552,8 +560,7 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
             reading.dropped_unreadable,
             started.elapsed().as_millis(),
         );
-        std::fs::write(debug.path(&format!("{stem}.txt")), summary)
-            .map_err(|error| OcrError::Image(error.to_string()))?;
+        note(std::fs::write(debug.path(&format!("{stem}.txt")), summary));
     }
 
     Ok(reading)
