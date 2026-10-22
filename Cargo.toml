@@ -2,6 +2,7 @@
 name = "xdg-desktop-portal-cosmic"
 version = "1.11.0"
 edition = "2024"
+rust-version = "1.93"
 license = "GPL-3.0-or-later"
 
 [features]

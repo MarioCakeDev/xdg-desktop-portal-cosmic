@@ -80,9 +80,16 @@ flow: OCR and the HTTP call run on a blocking thread, not the UI thread.
 ## Build
 
 ```sh
-cargo build --release
-cargo test --release            # engine + geometry + compositing tests
+cargo +stable build --release
+cargo +stable test --release     # engine + geometry + compositing tests
 ```
+
+Plain `cargo` on maripop is 1.90 and cannot resolve the locked dependencies
+(1.93); rustup's `stable` is 1.99.1. `+stable` overrides it for these two
+commands; `rustup default stable` makes it permanent. `just build` (and
+`debian/rules` through it) still invokes plain `cargo`, which is why the root
+package declares `rust-version = "1.93"` — on 1.90 that now fails with the
+required version instead of a resolver wall.
 
 The binary is `target/release/xdg-desktop-portal-cosmic`.
 
@@ -120,6 +127,13 @@ systemctl --user restart xdg-desktop-portal.service
 
 The package file is restored from `/usr/libexec/xdg-desktop-portal-cosmic.distrib`
 by `dpkg-divert --remove`.
+
+The downgrade also resets the whole `screenshot` config, not just the language:
+the newer file contains `screenshot.target_language`, the older struct has
+`deny_unknown_fields`, and `Config::get_entry` decodes it as one entry — so
+`save_location`, `choice` and `last_rectangle` fall back to their defaults too,
+and the next screenshot writes those defaults back. Note them before rolling
+back if they matter.
 
 ## Limits
 

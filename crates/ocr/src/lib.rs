@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a4458324041119ca184ed7946b763e8ad6c30d0b (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 0da621db9166852fe5deffaefa2f646535538141 (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
