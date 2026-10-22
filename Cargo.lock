@@ -1614,6 +1614,7 @@ dependencies = [
  "cosmic-screenshot-ocr",
  "cosmic-screenshot-overlay",
  "cosmic-screenshot-translation",
+ "tempfile",
 ]
 
 [[package]]

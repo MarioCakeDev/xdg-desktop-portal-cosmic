@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 3b7ff2f5b6544da58ab0ab1d4ab1c523c8313ceb (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a4458324041119ca184ed7946b763e8ad6c30d0b (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -11,9 +11,9 @@
 //! pure so it is tested against fixtures.
 //!
 //! A screenshot is not a document. The defaults are tuned for one: the crop is
-//! binarised before recognition (grey, histogram stretch, hard threshold),
-//! because game UI is anti-aliased light text on a dark panel and Tesseract
-//! reads the soft edges as strokes — `Advancements` comes back as
+//! binarised before recognition (grey, histogram stretch, polarity normalised,
+//! hard threshold), because game UI is anti-aliased light text on a dark panel
+//! and Tesseract reads the soft edges as strokes — `Advancements` comes back as
 //! `AYancernrentS` on the raw pixels; the crop is then enlarged with nearest
 //! neighbour, because the font is already a bitmap and interpolation only
 //! blurs its strokes; one uniform-block pass (6) reads it, with a sparse-text
@@ -67,8 +67,9 @@ pub const SCALE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_SCALE";
 /// readable at all.
 pub const BINARIZE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_BINARIZE";
 
-/// Luma split point for the binarised crop (`1`–`254`). Raise it for a dim
-/// capture, lower it when panel shading bleeds into the glyphs.
+/// Luma split point for the binarised crop (`1`–`254`), after the crop has been
+/// normalised to dark ink on light paper. Raise it for a dim capture, lower it
+/// when panel shading bleeds into the glyphs.
 pub const THRESHOLD_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_THRESHOLD";
 
 /// Set to `0`/`false`/`off` to hand the translator exactly what Tesseract read,
@@ -561,8 +562,18 @@ impl Prepared {
             // stretch the histogram so a dim capture still uses the full range,
             // then split hard: Tesseract reads the edges of soft glyphs as
             // strokes and returns `AYancernrentS` for `Advancements`.
+            //
+            // The split calls everything at or above the threshold *paper*. On
+            // a dark panel that is the glyph, not the background, so the crop
+            // came out white-on-black and every line dimmer than the threshold
+            // (secondary text, a disabled label, a timestamp) was folded into
+            // the background and never reached Tesseract. Put the paper on the
+            // bright side first, so one threshold reads both themes.
             let mut luma = prepared.to_luma8();
             autocontrast(&mut luma);
+            if paper_is_dark(&luma) {
+                invert(&mut luma);
+            }
             split_at(&mut luma, config.threshold);
             image::DynamicImage::ImageLuma8(luma)
         } else {
@@ -619,6 +630,37 @@ fn autocontrast(image: &mut image::GrayImage) {
 fn split_at(image: &mut image::GrayImage, threshold: u8) {
     for pixel in image.pixels_mut() {
         pixel.0[0] = if pixel.0[0] >= threshold { 255 } else { 0 };
+    }
+}
+
+/// Is the background of this stretched crop the dark side of mid-grey?
+///
+/// A screenshot is mostly background, so the median luma names it. Light text
+/// on a dark panel has to be flipped before [`split_at`], or the threshold
+/// separates *bright text from dim text* instead of text from background.
+fn paper_is_dark(image: &image::GrayImage) -> bool {
+    let mut histogram = [0u32; 256];
+    for pixel in image.pixels() {
+        histogram[pixel.0[0] as usize] += 1;
+    }
+    let total: u32 = histogram.iter().sum();
+    if total == 0 {
+        return false;
+    }
+    let mut seen = 0u32;
+    for (value, count) in histogram.iter().enumerate() {
+        seen += count;
+        if seen * 2 >= total {
+            return value < 128;
+        }
+    }
+    false
+}
+
+/// Swap ink and paper, so the dark side is ink whatever the theme.
+fn invert(image: &mut image::GrayImage) {
+    for pixel in image.pixels_mut() {
+        pixel.0[0] = 255 - pixel.0[0];
     }
 }
 
@@ -1363,6 +1405,35 @@ mod tests {
         split_at(&mut image, DEFAULT_THRESHOLD);
         let split: Vec<u8> = image.pixels().map(|pixel| pixel.0[0]).collect();
         assert_eq!(split, vec![0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_dark_panel_is_flipped_so_dim_text_stays_ink() {
+        // Background, bright glyph, background, dim glyph — the failing capture
+        // in miniature (Element's primary and secondary text on #1b1b1b).
+        let mut image = image::GrayImage::from_raw(4, 1, vec![27, 230, 27, 138]).expect("image");
+        autocontrast(&mut image);
+        assert!(paper_is_dark(&image), "a dark panel must be recognised");
+        invert(&mut image);
+        split_at(&mut image, DEFAULT_THRESHOLD);
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+            vec![255, 0, 255, 0],
+            "paper stays white, both the bright and the dim glyph stay ink"
+        );
+    }
+
+    #[test]
+    fn a_light_page_keeps_its_polarity() {
+        // Background, glyph, background, dim glyph on white paper.
+        let mut image = image::GrayImage::from_raw(4, 1, vec![255, 30, 255, 150]).expect("image");
+        autocontrast(&mut image);
+        assert!(!paper_is_dark(&image), "a light page must not be flipped");
+        split_at(&mut image, DEFAULT_THRESHOLD);
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+            vec![255, 0, 255, 0]
+        );
     }
 
     #[test]

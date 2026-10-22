@@ -458,11 +458,16 @@ impl Args {
     }
 }
 
-/// The target the dialog opens with: the session's language when it is one of
-/// the 23 targets, English otherwise. The owner can change it in the toolbar.
-fn target_index() -> usize {
-    lang::from_locale()
-        .and_then(|info| lang::LANGS.iter().position(|row| row.code == info.code))
+/// The target the dialog opens with: the language last picked in the toolbar
+/// when it is still one of the 23 targets, else the session's language when it
+/// is one, else English. The owner can change it in the toolbar.
+fn target_index(stored: Option<&str>) -> usize {
+    stored
+        .and_then(|code| lang::LANGS.iter().position(|row| row.code == code))
+        .or_else(|| {
+            lang::from_locale()
+                .and_then(|info| lang::LANGS.iter().position(|row| row.code == info.code))
+        })
         .unwrap_or_else(|| {
             lang::LANGS
                 .iter()
@@ -589,7 +594,7 @@ impl Screenshot {
                     choice,
                     // will be updated
                     pristine: output_images_pristine,
-                    target_index: target_index(),
+                    target_index: target_index(config.target_language.as_deref()),
                     translating: false,
                     status: None,
                 }))
@@ -889,7 +894,7 @@ pub fn update_msg(
                     config::screenshot::Screenshot {
                         choice,
                         last_rectangle: last_rect,
-                        ..portal.config.screenshot
+                        ..portal.config.screenshot.clone()
                     },
                 ))
             } else {
@@ -943,6 +948,7 @@ pub fn update_msg(
                         save_location: loc,
                         choice: (&mut portal.config.screenshot.choice).into(),
                         last_rectangle: portal.config.screenshot.last_rectangle,
+                        target_language: portal.config.screenshot.target_language.clone(),
                     },
                 ))
             } else {
@@ -951,14 +957,30 @@ pub fn update_msg(
             }
         }
         Msg::TargetLanguage(index) => {
+            let Some(info) = lang::LANGS.get(index) else {
+                tracing::error!("TargetLanguage index {index} is outside the language table.");
+                return cosmic::Task::none();
+            };
+            let code = info.code.to_string();
             if let Some(args) = portal.screenshot_args.as_mut() {
-                if index < lang::LANGS.len() {
-                    args.target_index = index;
-                }
+                args.target_index = index;
             } else {
                 tracing::error!("Failed to find screenshot Args for TargetLanguage message.");
             }
-            cosmic::Task::none()
+            // Remember the pick the moment it is made: an aborted or failed
+            // translate must not lose it, and the next dialog opens on it.
+            let choice = (&mut portal.config.screenshot.choice).into();
+            let next = config::screenshot::Screenshot {
+                choice,
+                last_rectangle: portal.config.screenshot.last_rectangle,
+                target_language: Some(code),
+                save_location: portal.config.screenshot.save_location,
+            };
+            // Keep the in-memory copy in step too: the Choice and Location
+            // handlers write the whole struct from it, and a stale copy would
+            // drop the language again on the next save.
+            portal.config.screenshot = next.clone();
+            cosmic::task::message(crate::app::Msg::ConfigSetScreenshot(next))
         }
         Msg::Translate { output } => {
             if portal.screenshot_args.is_none() {
@@ -1115,8 +1137,13 @@ pub fn update_msg(
                                 done.found
                             )
                         }
-                    } else {
+                    } else if done.translated == 0 && done.drawn == 0 && done.skipped_code > 0 {
                         format!(
+                            "the selection is code — {} line(s) left as they are",
+                            done.skipped_code
+                        )
+                    } else {
+                        let mut line = format!(
                             "{} → {} · found {}, kept {}, translated {}, drawn {}",
                             done.source,
                             done.target.name,
@@ -1124,7 +1151,14 @@ pub fn update_msg(
                             done.kept,
                             done.translated,
                             done.drawn
-                        )
+                        );
+                        if done.skipped_code > 0 {
+                            line.push_str(&format!(
+                                " · {} code line(s) left as-is",
+                                done.skipped_code
+                            ));
+                        }
+                        line
                     });
                 }
                 Err(message) => args.status = Some(message),
@@ -1244,5 +1278,32 @@ pub fn update_args(
     } else {
         tracing::info!("Existing screenshot args updated");
         cosmic::Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dialog_opens_on_the_language_last_picked() {
+        let german = lang::LANGS
+            .iter()
+            .position(|row| row.code == "de")
+            .expect("German is in the table");
+        assert_eq!(target_index(Some("de")), german);
+        assert_eq!(
+            target_index(Some("ja")),
+            lang::LANGS.iter().position(|row| row.code == "ja").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_stale_or_missing_language_falls_back_to_a_valid_index() {
+        // A code that is no longer in the table must not become a stale index.
+        for stored in [None, Some("tlh"), Some(""), Some("DE")] {
+            let index = target_index(stored);
+            assert!(index < lang::LANGS.len(), "{stored:?} -> {index}");
+        }
     }
 }

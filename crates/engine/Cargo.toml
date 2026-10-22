@@ -9,3 +9,6 @@ license = "GPL-3.0-only"
 cosmic-screenshot-ocr = { path = "../ocr" }
 cosmic-screenshot-overlay = { path = "../overlay" }
 cosmic-screenshot-translation = { path = "../translation" }
+
+[dev-dependencies]
+tempfile = "3"

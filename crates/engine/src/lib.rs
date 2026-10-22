@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at 3b7ff2f5b6544da58ab0ab1d4ab1c523c8313ceb (crates/engine).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a4458324041119ca184ed7946b763e8ad6c30d0b (crates/engine).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! The translate-the-capture pipeline: OCR, auto-detect, translate, overlay.
@@ -70,6 +70,8 @@ pub struct Applied {
     pub kept: usize,
     /// Lines the engine returned non-empty text for.
     pub translated: usize,
+    /// Lines left exactly as they were because they are code, not prose.
+    pub skipped_code: usize,
     pub report: overlay::Report,
     pub detected_source: Option<Lang>,
     /// The source language came from a low-confidence fallback, not detection.
@@ -93,12 +95,17 @@ impl Applied {
     /// A complete, honest accounting: found, kept, translated, drawn.
     ///
     /// One translated line out of ten must never read as success, and a run
-    /// that found text but judged none of it readable must say so.
+    /// that found text but judged none of it readable must say so. Code lines
+    /// are named separately: they were read, and deliberately not painted.
     pub fn counts(&self) -> String {
-        format!(
+        let mut counts = format!(
             "found {}, kept {}, translated {}, drawn {}",
             self.found, self.kept, self.translated, self.report.drawn
-        )
+        );
+        if self.skipped_code > 0 {
+            counts.push_str(&format!(" · {} code line(s) left as-is", self.skipped_code));
+        }
+        counts
     }
 
     /// The line to show when the run did nothing, or `None` when it painted.
@@ -118,6 +125,12 @@ impl Applied {
                     self.found
                 )
             });
+        }
+        if self.translated == 0 && self.report.drawn == 0 && self.skipped_code > 0 {
+            return Some(format!(
+                "the capture is code — {} line(s) left as they are",
+                self.skipped_code
+            ));
         }
         None
     }
@@ -472,13 +485,31 @@ pub fn apply(
     if blocks.is_empty() {
         return Err(Error::NoText);
     }
-    let texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+    // A code block is not prose: `cd ~/src/…` came back as "Trinkfisch ~/src/…"
+    // and `target/` as "Ziel/Dateigabe". Leave those lines exactly as they are
+    // instead of painting a guess over them.
+    let prose: Vec<&TextBlock> = blocks
+        .iter()
+        .filter(|block| !looks_like_code(&block.text))
+        .collect();
+    let skipped_code = blocks.len() - prose.len();
+    if prose.is_empty() {
+        return Ok(Applied {
+            blocks: blocks.len(),
+            found: blocks.len(),
+            kept: blocks.len(),
+            skipped_code,
+            target: Some(target),
+            ..Applied::default()
+        });
+    }
+    let texts: Vec<&str> = prose.iter().map(|block| block.text.as_str()).collect();
     let batch = translator
         .translate(&texts, target, source)
         .map_err(Error::Translation)?;
-    if batch.items.len() != blocks.len() {
+    if batch.items.len() != prose.len() {
         return Err(Error::Translation(TranslateError::CountMismatch {
-            requested: blocks.len(),
+            requested: prose.len(),
             received: batch.items.len(),
         }));
     }
@@ -496,6 +527,7 @@ pub fn apply(
             found: blocks.len(),
             kept: blocks.len(),
             translated: blocks.len(),
+            skipped_code,
             detected_source,
             source_assumed,
             same_language: true,
@@ -504,7 +536,7 @@ pub fn apply(
         });
     }
 
-    let translated: Vec<TranslatedBlock> = blocks
+    let translated: Vec<TranslatedBlock> = prose
         .iter()
         .zip(&batch.items)
         .map(|(block, item)| TranslatedBlock {
@@ -529,6 +561,7 @@ pub fn apply(
         found: blocks.len(),
         kept: blocks.len(),
         translated: written,
+        skipped_code,
         report,
         detected_source,
         source_assumed,
@@ -537,6 +570,141 @@ pub fn apply(
         debug_dir: None,
     })
 }
+
+/// Does this line look like code rather than prose?
+///
+/// Machine translation has no idea what a command is: `cd ~/src/x` came back as
+/// "Trinkfisch ~/src/x" and `target/` as "Ziel/Dateigabe", which is worse than
+/// leaving the line alone. The signals below are the cheap, high-precision
+/// ones — a path, a flag, a shell verb, shell punctuation — and a line needs
+/// two before it is treated as code, so ordinary prose that happens to contain
+/// a slash or an `install` still gets translated.
+pub fn looks_like_code(text: &str) -> bool {
+    /// Signals needed before a line is treated as code.
+    const CODE_SIGNALS: usize = 2;
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut signals = 0;
+
+    // A shell verb opens the line — or follows an `ENV=value` prefix.
+    if trimmed.split_whitespace().take(2).any(|token| {
+        SHELL_VERBS.contains(&token.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-'))
+    }) {
+        signals += 1;
+    }
+    if trimmed.starts_with('$') {
+        signals += 1;
+    }
+    if trimmed.contains(" && ")
+        || trimmed.contains(" || ")
+        || trimmed.contains(" | ")
+        || trimmed.contains("$(")
+        || trimmed.contains("${")
+        || trimmed.contains("2>&1")
+    {
+        signals += 1;
+    }
+    if trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains(';')
+        || trimmed.contains("=>")
+        || trimmed.contains("->")
+        || trimmed.contains("::")
+        || trimmed.contains("==")
+        || trimmed.contains("!=")
+    {
+        signals += 2;
+    }
+    for token in trimmed.split_whitespace() {
+        if token.starts_with('/')
+            || token.starts_with("~/")
+            || token.starts_with("./")
+            || token.starts_with("../")
+            || token.contains("://")
+        {
+            signals += 2;
+        } else if token.contains('/') && token.len() > 2 {
+            signals += 1;
+        }
+        if (token.starts_with("--") && token.len() > 2)
+            || (token.starts_with('-')
+                && token.len() == 2
+                && token
+                    .chars()
+                    .nth(1)
+                    .is_some_and(|c| c.is_ascii_alphabetic()))
+        {
+            signals += 1;
+        }
+        // ENV=value at the start of a command.
+        if token.split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        }) {
+            signals += 1;
+        }
+        if signals >= CODE_SIGNALS {
+            return true;
+        }
+    }
+    signals >= CODE_SIGNALS
+}
+
+/// Shell verbs that start a command, never a sentence.
+const SHELL_VERBS: &[&str] = &[
+    "cd",
+    "sudo",
+    "git",
+    "apt",
+    "apt-get",
+    "dnf",
+    "pacman",
+    "cargo",
+    "rustup",
+    "systemctl",
+    "journalctl",
+    "docker",
+    "podman",
+    "kubectl",
+    "npm",
+    "pnpm",
+    "yarn",
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "rsync",
+    "mkdir",
+    "rmdir",
+    "rm",
+    "cp",
+    "mv",
+    "chmod",
+    "chown",
+    "make",
+    "just",
+    "install",
+    "tar",
+    "unzip",
+    "export",
+    "source",
+    "echo",
+    "grep",
+    "sed",
+    "awk",
+    "find",
+    "ln",
+    "mount",
+    "umount",
+    "ps",
+    "kill",
+    "systemd-run",
+];
 
 fn rect_of(block: &TextBlock) -> Rect {
     Rect::new(
@@ -1035,5 +1203,120 @@ mod tests {
             "the dump must show when the corrector fired: {report}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn code_lines_are_recognised_and_prose_is_not() {
+        for code in [
+            "cd ~/src/xdg-desktop-portal-cosmic",
+            "sudo install -m 0755 target/x /usr/libexec/",
+            "target/x /usr/libexec/",
+            "systemctl --user restart the.service",
+            "journalctl --user -f -u portal",
+            "cargo test --offline",
+            "RUST_LOG=debug just run",
+            "let x = 5;",
+            "if (a == b) {",
+            "https://example.com/x",
+        ] {
+            assert!(looks_like_code(code), "{code:?} must be code");
+        }
+        for prose in [
+            "Two commands:",
+            "Then: Super+Shift+S → …",
+            "install the portal build",
+            "restart the impl service",
+            "David Leinweber",
+            "The overlay still leaves part of the body",
+            "in English, and the code block is nonsense.",
+            "translated 7 of 8 lines",
+            "German · 2.1 s · 7 blocks",
+            "and/or",
+        ] {
+            assert!(!looks_like_code(prose), "{prose:?} must be prose");
+        }
+    }
+
+    #[test]
+    fn a_code_line_is_left_untouched_and_named_in_the_counts() {
+        let mut canvas = Canvas::filled(300, 140, [250, 250, 250, 255]);
+        let blocks = vec![
+            TextBlock {
+                bbox: Bbox {
+                    x: 10,
+                    y: 10,
+                    width: 100,
+                    height: 20,
+                },
+                text: "Two commands:".to_string(),
+                confidence: 95.0,
+            },
+            TextBlock {
+                bbox: Bbox {
+                    x: 10,
+                    y: 60,
+                    width: 200,
+                    height: 20,
+                },
+                text: "cd ~/src/xdg-desktop-portal-cosmic".to_string(),
+                confidence: 95.0,
+            },
+        ];
+        let translator = FakeTranslator::new("[de] ");
+        let applied = apply(
+            &mut canvas,
+            &blocks,
+            Lang::parse("de").unwrap(),
+            None,
+            &translator,
+            &Options::default(),
+        )
+        .expect("the run succeeds");
+
+        assert_eq!(applied.skipped_code, 1);
+        assert_eq!(applied.translated, 1);
+        assert_eq!(applied.report.drawn, 1, "only the prose is painted");
+        assert_eq!(
+            translator.calls()[0].texts,
+            vec!["Two commands:"],
+            "the code line must never reach the translator"
+        );
+        assert_eq!(
+            applied.counts(),
+            "found 2, kept 2, translated 1, drawn 1 · 1 code line(s) left as-is"
+        );
+    }
+
+    #[test]
+    fn a_capture_of_pure_code_says_so_instead_of_reporting_success() {
+        let mut canvas = Canvas::filled(300, 60, [250, 250, 250, 255]);
+        let blocks = vec![TextBlock {
+            bbox: Bbox {
+                x: 10,
+                y: 10,
+                width: 200,
+                height: 20,
+            },
+            text: "journalctl --user -f -u portal".to_string(),
+            confidence: 95.0,
+        }];
+        let translator = FakeTranslator::new("[de] ");
+        let applied = apply(
+            &mut canvas,
+            &blocks,
+            Lang::parse("de").unwrap(),
+            None,
+            &translator,
+            &Options::default(),
+        )
+        .expect("the run succeeds");
+
+        assert_eq!(applied.skipped_code, 1);
+        assert_eq!(applied.report.drawn, 0);
+        assert!(translator.calls().is_empty());
+        assert_eq!(
+            applied.explanation().as_deref(),
+            Some("the capture is code — 1 line(s) left as they are")
+        );
     }
 }

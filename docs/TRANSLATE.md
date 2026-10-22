@@ -9,6 +9,38 @@ captured buffer itself was replaced.
 
 There is no second window.
 
+## Remembered target language
+
+The picker's choice is stored in the portal's own per-user config, beside the
+last rectangle:
+
+`~/.config/cosmic/com.system76.CosmicPortal/v1/screenshot`
+→ `target_language: Some("de")`
+
+It is written the moment a language is picked, not when a translation succeeds,
+so an aborted or failed translate cannot lose it. The next dialog opens with it
+preselected, and it survives a portal restart and a reboot. When nothing is
+stored — or the stored code is no longer in the language table — the dialog
+falls back to the session locale and then English, exactly as before.
+
+The standalone CLI reads the same key: `--translate` (or `--target-language`)
+with no language uses the last pick, then the locale, then English. An explicit
+language always wins. The CLI never writes the key; the dialog owns it.
+
+## Dark panels and code lines
+
+OCR normally reads light text on a dark panel by turning the crop into
+white-on-black, which makes the threshold separate *bright text from dim text*
+instead of text from background. Every line below the threshold — secondary
+text, timestamps, bullets — was folded into the background and never reached
+Tesseract. The crop is now flipped when its background is the dark side, so the
+same threshold reads both themes.
+
+Lines that are code (a shell verb, a path, a flag, shell punctuation — two
+signals or more) are not sent to the translator: `cd ~/src/…` used to come back
+as "Trinkfisch ~/src/…". They are left exactly as they are and the status line
+names them (`… · 3 code line(s) left as-is`).
+
 ## Base
 
 - Fork of <https://github.com/pop-os/xdg-desktop-portal-cosmic>
@@ -26,6 +58,7 @@ There is no second window.
 | `src/screenshot_translate.rs` | **new**: region geometry, engine call, compositing |
 | `src/widget/screenshot.rs` | Translate button, language picker, one-line status row |
 | `src/main.rs` | one startup log line identifying the build |
+| `cosmic-portal-config/src/screenshot.rs` | `screenshot.target_language`, the remembered picker |
 | `Cargo.toml` | workspace members + four path dependencies |
 | `Cargo.lock` | regenerated |
 | `i18n/en/xdg_desktop_portal_cosmic.ftl` | `translate`, `translating` |
@@ -96,5 +129,6 @@ by `dpkg-divert --remove`.
   toolbar translates the part of the selection on its own screen. Selecting a
   region on one screen is the normal case.
 - Untranslated text stays in the original language (no OCR text → no boxes).
+  Code lines are deliberately left untouched; see above.
 - The status line is English, like the engine's one-line errors; the button and
   picker labels come from the i18n catalogue.

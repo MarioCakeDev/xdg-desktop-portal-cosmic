@@ -223,6 +223,47 @@ pub fn from_locale_value(value: &str) -> Option<&'static LangInfo> {
     find(&language)
 }
 
+/// The target language last picked in the portal's translate toolbar.
+///
+/// The dialog writes it into its own per-user state — `com.system76.CosmicPortal`,
+/// version 1, key `screenshot.target_language` — beside `last_rectangle`, so it
+/// survives a dialog close, a portal restart and a reboot. The CLI has no
+/// cosmic-config dependency and must not grow a second writer, so it reads that
+/// one key out of the same file. A missing file, a missing key, or a code that
+/// is no longer in [`LANGS`] is `None`: the caller falls back to the locale,
+/// exactly like a dialog that has never been used.
+pub fn remembered_target() -> Option<&'static LangInfo> {
+    remembered_target_in(&remembered_target_path()?)
+}
+
+/// The path the portal's `cosmic-config` uses for the screenshot state.
+pub fn remembered_target_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })?;
+    Some(base.join("cosmic/com.system76.CosmicPortal/v1/screenshot"))
+}
+
+/// [`remembered_target`] against an explicit file, for tests and for callers
+/// that already resolved the config path.
+pub fn remembered_target_in(path: &std::path::Path) -> Option<&'static LangInfo> {
+    let text = std::fs::read_to_string(path).ok()?;
+    find(stored_target_code(&text)?)
+}
+
+/// Pull `target_language: Some("de")` out of the config's RON.
+///
+/// Deliberately narrow: it reads one key, tolerates any whitespace the writer
+/// chose, and returns `None` for anything else rather than guessing.
+fn stored_target_code(text: &str) -> Option<&str> {
+    let rest = text.split("target_language:").nth(1)?.trim_start();
+    let rest = rest.strip_prefix("Some(")?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(&rest[..rest.find('"')?])
+}
+
 /// Tesseract's `-l` value for all supported source languages. `eng` comes first
 /// because Tesseract weights the first language; the rest is sorted for a
 /// stable list.
@@ -306,5 +347,50 @@ mod tests {
         assert_eq!(from_locale_value("pt_BR.UTF-8").unwrap().code, "pt");
         assert_eq!(from_locale_value("ja_JP.UTF-8").unwrap().code, "ja");
         assert!(from_locale_value("C.UTF-8").is_none());
+    }
+
+    #[test]
+    fn the_remembered_target_is_read_out_of_the_portal_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("screenshot");
+
+        // The exact shape cosmic-config writes on maripop, with the new key.
+        std::fs::write(
+            &path,
+            "(save_location: Clipboard, choice: Rectangle, last_rectangle: Some((left: 3001, \
+             top: 65, right: 3840, bottom: 956)), target_language: Some(\"de\"))",
+        )
+        .expect("write config");
+        assert_eq!(
+            remembered_target_in(&path).map(|info| info.code),
+            Some("de")
+        );
+
+        // Any spacing the writer chooses, and a never-picked language.
+        std::fs::write(&path, "target_language:None").expect("write config");
+        assert!(remembered_target_in(&path).is_none());
+        std::fs::write(&path, "target_language: Some( \"ja\" )").expect("write config");
+        assert_eq!(
+            remembered_target_in(&path).map(|info| info.code),
+            Some("ja")
+        );
+
+        // A code that is no longer in the table, and a file that is not there.
+        std::fs::write(&path, "target_language: Some(\"tlh\")").expect("write config");
+        assert!(remembered_target_in(&path).is_none(), "no stale index");
+        assert!(remembered_target_in(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn a_stored_code_never_panics_on_garbage() {
+        for garbage in [
+            "",
+            "target_language:",
+            "target_language: Some(",
+            "target_language: Some(\"",
+            "last_rectangle: None",
+        ] {
+            assert!(stored_target_code(garbage).is_none(), "{garbage:?}");
+        }
     }
 }
