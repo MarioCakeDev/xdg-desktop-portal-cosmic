@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at da39878207579773cfc5f1d04141c026ac0d3381 (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at e17a03533ea96bd99431932eeb4ea66d5b7a110b (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -104,7 +104,9 @@ const FALLBACK_PSMS: [u8; 1] = [11];
 const FALLBACK_BELOW_LINES: usize = 2;
 
 /// One crop gets one polarity; a flat block on the other side of it is read
-/// again from its own rows. At most this many bands per crop…
+/// again from its own rows. At most this many bands per crop — the tallest are
+/// kept, in page order, because a page that splits into many narrow strips (a
+/// two-column layout) is one of the cases this retry exists for.
 const MAX_RETRY_BANDS: usize = 4;
 
 /// Shorter than this (in capture pixels) is not a line of text. The band is
@@ -115,9 +117,25 @@ const MIN_BAND_ROWS: u32 = 8;
 /// How far a row's opposite-pixel colour may drift and stay one band.
 const BAND_FLATNESS: f32 = 16.0;
 
-/// Share of a row's width that must be on the opposite side of the paper. A
-/// highlight around a passage is wide; an avatar or an icon is not.
+/// Rows of margin above and below a band, so ascenders and descenders are not
+/// clipped. [`Prepared::band_crop`] returns the row it started at, so the
+/// caller maps Tesseract's rows back through the margin.
+const BAND_MARGIN: u32 = 4;
+
+/// Share of a row that must be on the opposite side of the paper before the
+/// row's colour is worth taking: enough pixels for a mode, and no more.
 const BAND_MIN_SHARE: f32 = 0.05;
+
+/// The longest unbroken run of other-paper pixels a band must hold at least
+/// once, as a share of the row's width.
+///
+/// This is what tells a passage from the page's own ink, and a luma distance
+/// from the paper cannot: light text on a dark page sits on the far side of
+/// the split too. Ink is strokes — runs of a few pixels, each broken by the
+/// page's paper — while a passage has at least one row that is one run of its
+/// own paper. Without this test a page line the primary pass dropped became a
+/// band, was re-read upside down and could be repainted as a misreading.
+const BAND_MIN_RUN_SHARE: f32 = 0.15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bbox {
@@ -564,14 +582,14 @@ fn retry_bands(prepared: &Prepared, reading: &Reading) -> Vec<Band> {
     let Some(luma) = &prepared.luma else {
         return Vec::new();
     };
-    let bands = unread_bands(
+    let mut bands = unread_bands(
         luma,
         prepared.paper,
         prepared.threshold,
         &reading.blocks,
         prepared.scale,
     );
-    if bands.is_empty() || bands.len() > MAX_RETRY_BANDS {
+    if bands.is_empty() {
         return Vec::new();
     }
     // The primary pass has to have read *something*. Note what this can and
@@ -583,6 +601,15 @@ fn retry_bands(prepared: &Prepared, reading: &Reading) -> Vec<Band> {
     // never *kept* from its inverted image even when a pass is spent on it.
     if reading.blocks.is_empty() {
         return Vec::new();
+    }
+    if bands.len() > MAX_RETRY_BANDS {
+        // One narrow band per strip is what a two-column page looks like, and
+        // that layout is a case this retry exists for: refusing every band on
+        // the count would skip it. Spend the passes on the tallest instead,
+        // then read them in page order.
+        bands.sort_by_key(|band| (std::cmp::Reverse(band.height()), band.top));
+        bands.truncate(MAX_RETRY_BANDS);
+        bands.sort_by_key(|band| band.top);
     }
     bands
 }
@@ -729,23 +756,23 @@ impl Prepared {
     }
 
     /// One band of the crop with the paper put on the *other* side of the
-    /// threshold, as a temporary file Tesseract can read.
-    fn band_crop(&self, band: Band) -> Result<tempfile::NamedTempFile, OcrError> {
+    /// threshold, as a temporary file Tesseract can read — plus the prepared
+    /// row the crop actually starts at, margin included, so the caller can map
+    /// Tesseract's rows back to the capture.
+    fn band_crop(&self, band: Band) -> Result<(tempfile::NamedTempFile, u32), OcrError> {
         let Some(luma) = &self.luma else {
             return Err(OcrError::Image(
                 "no greyscale crop for a polarity retry".to_string(),
             ));
         };
-        // A few rows of margin so ascenders and descenders are not clipped.
-        let margin = 4;
-        let top = band.top.saturating_sub(margin);
-        let bottom = (band.bottom + margin).min(luma.height());
+        let top = band.top.saturating_sub(BAND_MARGIN);
+        let bottom = (band.bottom + BAND_MARGIN).min(luma.height());
         let height = bottom.saturating_sub(top).max(1);
         let mut crop = image::imageops::crop_imm(luma, 0, top, luma.width(), height).to_image();
         // The primary image inverted when the crop's paper was dark; the retry
         // is the opposite choice, so invert exactly when the primary did not.
         binarise(&mut crop, !self.inverted, self.threshold);
-        write_temp(image::DynamicImage::ImageLuma8(crop))
+        Ok((write_temp(image::DynamicImage::ImageLuma8(crop))?, top))
     }
 }
 
@@ -855,10 +882,10 @@ fn run_pass(
     let (path, offset, stem) = match variant {
         Variant::Paper => (prepared.path.clone(), 0, format!("psm{psm}")),
         Variant::Opposite(index, band) => {
-            let file = prepared.band_crop(band)?;
+            let (file, top) = prepared.band_crop(band)?;
             let path = file.path().to_path_buf();
             _band_file = file;
-            (path, band.top, format!("psm{psm}-opposite-{index}"))
+            (path, top, format!("psm{psm}-opposite-{index}"))
         }
     };
     let output = Command::new(&config.binary)
@@ -895,8 +922,9 @@ fn run_pass(
     let mut low_confidence = 0;
     let mut unreadable = 0;
     for mut block in parsed {
-        // A band crop starts at the band, so its rows have to move down before
-        // they are mapped back to capture pixels.
+        // A band crop starts at the row `band_crop` reports — the band minus
+        // its margin — so Tesseract's rows have to move down by exactly that
+        // before they are mapped back to capture pixels.
         block.bbox.y = block.bbox.y.saturating_add(offset);
         block.bbox = block.bbox.scaled(prepared.scale);
         if block.confidence < config.min_confidence {
@@ -1002,6 +1030,7 @@ fn unread_bands(
     let delta = 255u8.saturating_sub(threshold);
     let paper_is_dark = paper < 128;
     let needed = ((width as f32 * BAND_MIN_SHARE) as u32).max(8);
+    let needed_run = ((width as f32 * BAND_MIN_RUN_SHARE) as u32).max(12);
 
     let mut covered = vec![false; height as usize];
     let step = scale.max(1);
@@ -1014,7 +1043,10 @@ fn unread_bands(
     }
 
     let mut bands: Vec<Band> = Vec::new();
-    let mut current: Option<(Band, f32)> = None;
+    // The band being built, its anchor colour, and whether any of its rows has
+    // been one unbroken run of the other *paper* rather than a line of the
+    // other ink.
+    let mut current: Option<(Band, f32, bool)> = None;
     for row in 0..height {
         let opposite = if covered[row as usize] {
             None
@@ -1022,52 +1054,58 @@ fn unread_bands(
             opposite_row(luma, row, paper, delta, paper_is_dark, needed)
         };
         match opposite {
-            Some(median) => match current {
-                Some((mut band, anchor)) if (median - anchor).abs() <= BAND_FLATNESS => {
-                    band.bottom = row + 1;
-                    current = Some((band, anchor));
+            Some((median, longest)) => {
+                let paper_row = longest >= needed_run;
+                match current {
+                    Some((mut band, anchor, paper)) if (median - anchor).abs() <= BAND_FLATNESS => {
+                        band.bottom = row + 1;
+                        current = Some((band, anchor, paper || paper_row));
+                    }
+                    Some((band, _, paper)) => {
+                        push_band(&mut bands, band, scale, paper);
+                        current = Some((
+                            Band {
+                                top: row,
+                                bottom: row + 1,
+                            },
+                            median,
+                            paper_row,
+                        ));
+                    }
+                    None => {
+                        current = Some((
+                            Band {
+                                top: row,
+                                bottom: row + 1,
+                            },
+                            median,
+                            paper_row,
+                        ));
+                    }
                 }
-                Some((band, _)) => {
-                    push_band(&mut bands, band, scale);
-                    current = Some((
-                        Band {
-                            top: row,
-                            bottom: row + 1,
-                        },
-                        median,
-                    ));
-                }
-                None => {
-                    current = Some((
-                        Band {
-                            top: row,
-                            bottom: row + 1,
-                        },
-                        median,
-                    ));
-                }
-            },
+            }
             None => {
-                if let Some((band, _)) = current.take() {
-                    push_band(&mut bands, band, scale);
+                if let Some((band, _, paper)) = current.take() {
+                    push_band(&mut bands, band, scale, paper);
                 }
             }
         }
     }
-    if let Some((band, _)) = current {
-        push_band(&mut bands, band, scale);
+    if let Some((band, _, paper)) = current {
+        push_band(&mut bands, band, scale, paper);
     }
     bands
 }
 
-/// The dominant luma of this row's opposite-polarity pixels, when enough of
-/// the row is on the other side of the paper to be a block rather than an
-/// icon.
+/// The dominant luma of this row's opposite-polarity pixels — and the longest
+/// unbroken run of them — when enough of the row is on the other side of the
+/// paper to be worth taking.
 ///
 /// Modal, not median: a row that crosses a line of glyphs also holds the
 /// glyphs' antialiasing, and a median there drops towards the ink and splits
 /// one flat passage into a band per line. The passage's paper is still the most
-/// common colour in its own row.
+/// common colour in its own row. The run is what tells the passage's own paper
+/// from the page's own ink: see [`BAND_MIN_RUN_SHARE`].
 fn opposite_row(
     luma: &image::GrayImage,
     row: u32,
@@ -1075,10 +1113,12 @@ fn opposite_row(
     delta: u8,
     paper_is_dark: bool,
     needed: u32,
-) -> Option<f32> {
+) -> Option<(f32, u32)> {
     // 32 buckets of (count, sum) over the luma range.
     let mut buckets = [[0u32; 2]; 32];
     let mut count = 0u32;
+    let mut run = 0u32;
+    let mut longest = 0u32;
     for x in 0..luma.width() {
         let value = luma.get_pixel(x, row)[0];
         let opposite = if paper_is_dark {
@@ -1091,6 +1131,10 @@ fn opposite_row(
             bucket[0] += 1;
             bucket[1] += value as u32;
             count += 1;
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
         }
     }
     if count < needed {
@@ -1102,10 +1146,16 @@ fn opposite_row(
         .copied()
         .unwrap_or([0, 0]);
     let total = winner[0].max(1);
-    Some(winner[1] as f32 / total as f32)
+    Some((winner[1] as f32 / total as f32, longest))
 }
 
-fn push_band(bands: &mut Vec<Band>, band: Band, scale: u32) {
+fn push_band(bands: &mut Vec<Band>, band: Band, scale: u32, paper: bool) {
+    if !paper {
+        // Every row here is the other *ink* and never one run of the other
+        // paper: a page line the primary pass dropped, not a passage. Reading
+        // it upside down is how a misreading gets repainted.
+        return;
+    }
     // `band` is in prepared rows, `MIN_BAND_ROWS` in capture pixels.
     if band.height() >= MIN_BAND_ROWS.saturating_mul(scale.max(1)) {
         bands.push(band);
@@ -1915,6 +1965,24 @@ mod tests {
         image
     }
 
+    /// 60×100 RGBA: a dark page with one light line of the page's own text on
+    /// rows 10..16, and a light passage on rows 40..80. The page's line is
+    /// strokes over a fifth of the row; the passage is mostly its own paper.
+    fn rgba_page_with_light_text() -> image::RgbaImage {
+        let mut image = image::RgbaImage::from_pixel(60, 100, image::Rgba([32, 32, 32, 255]));
+        for y in 10..16 {
+            for x in (6..54).step_by(4) {
+                image.put_pixel(x, y, image::Rgba([226, 226, 226, 255]));
+            }
+        }
+        for y in 40..80 {
+            for x in 5..55 {
+                image.put_pixel(x, y, image::Rgba([206, 226, 246, 255]));
+            }
+        }
+        image
+    }
+
     fn rgba_capture() -> image::RgbaImage {
         let mut image = image::RgbaImage::from_pixel(60, 100, image::Rgba([32, 32, 32, 255]));
         for y in 30..70 {
@@ -1994,6 +2062,37 @@ mod tests {
             }
         }
         assert!(unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1).is_empty());
+    }
+
+    #[test]
+    fn the_page_s_own_light_ink_never_forms_a_band() {
+        // A luma distance from the paper cannot tell the page's own light text
+        // from a light block: both sit on the far side of the split. A dropped
+        // page line became a band that way, was re-read upside down and could
+        // be repainted as a misreading. The page's ink is strokes over part of
+        // the row; a passage is mostly the other paper.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_page_with_light_text()
+            .save(&path)
+            .expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+        let bands = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert_eq!(
+            bands,
+            vec![Band {
+                top: 40 * prepared.scale,
+                bottom: 80 * prepared.scale
+            }],
+            "only the passage is a band; the page's own line is not"
+        );
     }
 
     #[test]
@@ -2080,15 +2179,96 @@ mod tests {
 
         // The retry image: the passage's own paper is white and its glyphs are
         // ink, so Tesseract can read the lines it never saw.
-        let crop = prepared.band_crop(band).expect("band crop");
+        let (crop, started_at) = prepared.band_crop(band).expect("band crop");
         let luma = image::open(crop.path()).expect("read band").to_luma8();
-        let margin = band.top.saturating_sub(4);
-        let top = band.top - margin;
+        let top = band.top - started_at;
         let bottom = top + band.height();
         let share = black_share(&luma, top, bottom);
         assert!(
             (0.02..0.6).contains(&share),
             "the passage's glyphs must be ink on its own paper, got {share}"
+        );
+    }
+
+    #[test]
+    fn the_band_crop_reports_the_row_it_starts_at() {
+        // The margin above the band is real, so the caller must offset by the
+        // row the crop starts at and not by the band's own top: getting this
+        // wrong moved every recovered box four prepared rows down.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_capture().save(&path).expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+        let luma = prepared.luma.as_ref().expect("greyscale kept").clone();
+
+        let band = Band {
+            top: 40,
+            bottom: 90,
+        };
+        let (crop, started_at) = prepared.band_crop(band).expect("band crop");
+        assert_eq!(started_at, band.top - BAND_MARGIN);
+
+        let crop = image::open(crop.path()).expect("read band").to_luma8();
+        assert_eq!(crop.height(), band.height() + 2 * BAND_MARGIN);
+        let mut expected = luma;
+        binarise(&mut expected, !prepared.inverted, prepared.threshold);
+        for y in 0..crop.height() {
+            for x in 0..crop.width() {
+                assert_eq!(
+                    crop.get_pixel(x, y),
+                    expected.get_pixel(x, started_at + y),
+                    "crop row {y} is prepared row {}",
+                    started_at + y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn more_bands_than_the_cap_keep_the_tallest_in_page_order() {
+        // A two-column page is one narrow band per strip. Refusing every band
+        // on the count skipped exactly the layout the retry exists for.
+        let mut image = image::GrayImage::from_pixel(60, 200, image::Luma([30]));
+        for index in 0..6u32 {
+            for y in (10 + index * 30)..(30 + index * 30) {
+                for x in 5..55 {
+                    image.put_pixel(x, y, image::Luma([220]));
+                }
+            }
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        image.save(&path).expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+
+        let all = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert_eq!(all.len(), 6, "{all:?}");
+
+        let mut reading = Reading::default();
+        reading.blocks.push(TextBlock {
+            bbox: Bbox {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 2,
+            },
+            text: "page".to_string(),
+            confidence: 90.0,
+        });
+        let kept = retry_bands(&prepared, &reading);
+        assert_eq!(kept.len(), MAX_RETRY_BANDS, "{kept:?}");
+        assert_eq!(
+            kept,
+            all[..MAX_RETRY_BANDS].to_vec(),
+            "the tallest bands, back in page order"
         );
     }
 
@@ -2099,11 +2279,11 @@ mod tests {
         // dropped at the other.
         let band = Band { top: 0, bottom: 12 };
         let mut kept = Vec::new();
-        push_band(&mut kept, band, 1);
+        push_band(&mut kept, band, 1, true);
         assert_eq!(kept, vec![band], "12 capture rows is already a band");
 
         let mut dropped = Vec::new();
-        push_band(&mut dropped, band, 2);
+        push_band(&mut dropped, band, 2, true);
         assert!(
             dropped.is_empty(),
             "at 2× the floor is 16 prepared rows, got 12"
