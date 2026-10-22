@@ -1,0 +1,14 @@
+[package]
+name = "cosmic-screenshot-engine"
+version = "1.11.0"
+edition = "2024"
+description = "OCR, auto-detection, translation and in-place overlay in one shared pipeline"
+license = "GPL-3.0-only"
+
+[dependencies]
+cosmic-screenshot-ocr = { path = "../ocr" }
+cosmic-screenshot-overlay = { path = "../overlay" }
+cosmic-screenshot-translation = { path = "../translation" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -28,10 +28,13 @@ use zbus::zvariant;
 use crate::app::{CosmicPortal, OutputState};
 use crate::config::screenshot::ImageSaveLocation;
 use crate::config::{self};
+use crate::screenshot_translate::{self as translate, LogicalRect, Region};
 use crate::wayland::{CaptureSource, ShmImage, WaylandHelper};
 use crate::widget::keyboard_wrapper::KeyboardWrapper;
 use crate::widget::rectangle_selection::DragState;
+use crate::widget::screenshot::TranslateControls;
 use crate::{PortalResponse, fl, subscription};
+use cosmic_screenshot_engine::lang;
 
 #[derive(Clone, Debug)]
 pub struct ScreenshotImage {
@@ -382,6 +385,14 @@ pub enum Msg {
     OutputChanged(WlOutput),
     WindowChosen(String, usize),
     Location(usize),
+    /// Translate the selected area of this dialog's output, in place.
+    Translate {
+        output: String,
+    },
+    /// A new target language was picked for the next translation.
+    TargetLanguage(usize),
+    /// The background task finished: the repainted region, or one line of why.
+    Translated(Result<translate::Translated, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +436,61 @@ pub struct Args {
     pub choice: Choice,
     pub location: ImageSaveLocation,
     pub action: Action,
+    /// The untouched capture of each output. Translate always repaints these,
+    /// so translating twice (or into a second language) cannot compound two
+    /// overlays on the same glyphs.
+    pub pristine: HashMap<String, RgbaImage>,
+    /// Index into [`lang::LANGS`]: the target of the next translation.
+    pub target_index: usize,
+    /// A translation is running. The dialog stays usable; the button says so.
+    pub translating: bool,
+    /// One line under the toolbar: the result, or the reason it failed.
+    pub status: Option<String>,
+}
+
+impl Args {
+    /// The chosen target language. `LANGS` is non-empty and the index is only
+    /// ever set from a valid dropdown selection.
+    fn target(&self) -> &'static lang::LangInfo {
+        lang::LANGS
+            .get(self.target_index)
+            .unwrap_or(&lang::LANGS[0])
+    }
+}
+
+/// The target the dialog opens with: the language last picked in the toolbar
+/// when it is still one of the 23 targets, else the session's language when it
+/// is one, else English. The owner can change it in the toolbar.
+fn target_index(stored: Option<&str>) -> usize {
+    stored
+        .and_then(|code| lang::LANGS.iter().position(|row| row.code == code))
+        .or_else(|| {
+            lang::from_locale()
+                .and_then(|info| lang::LANGS.iter().position(|row| row.code == info.code))
+        })
+        .unwrap_or_else(|| {
+            lang::LANGS
+                .iter()
+                .position(|row| row.code == "en")
+                .unwrap_or(0)
+        })
+}
+
+/// The screenshot settings to persist after the picker moved to `index`.
+///
+/// `None` when `index` is outside the table (a stale widget, not a pick). The
+/// returned value is what [`crate::app::CosmicPortal::save_screenshot_config`]
+/// writes; it must not be installed into the in-memory config beforehand, or
+/// the setter's "only write when changed" check skips the file.
+fn language_pick(
+    current: &config::screenshot::Screenshot,
+    index: usize,
+) -> Option<config::screenshot::Screenshot> {
+    let info = lang::LANGS.get(index)?;
+    Some(config::screenshot::Screenshot {
+        target_language: Some(info.code.to_string()),
+        ..current.clone()
+    })
 }
 
 struct Output {
@@ -496,6 +562,12 @@ impl Screenshot {
                 .interactive_toplevel_images(&outputs)
                 .await
                 .unwrap_or_default();
+            // Keep the untouched pixels: Translate repaints these, so a second
+            // translation starts from the original glyphs, not the first result.
+            let output_images_pristine = output_images
+                .iter()
+                .map(|(name, image)| (name.clone(), image.rgba.clone()))
+                .collect();
             // TODO: Maybe replace config's Choice with Choice from this file
             let choice = match config.choice {
                 config::screenshot::Choice::Output(Some(output))
@@ -538,6 +610,10 @@ impl Screenshot {
                     // TODO cover all outputs at start of rectangle?
                     choice,
                     // will be updated
+                    pristine: output_images_pristine,
+                    target_index: target_index(config.target_language.as_deref()),
+                    translating: false,
+                    status: None,
                 }))
                 .await
             {
@@ -595,6 +671,13 @@ pub(crate) fn view(portal: &CosmicPortal, id: window::Id) -> cosmic::Element<'_,
         return space::horizontal().width(Length::Fixed(1.0)).into();
     };
     let theme = portal.core.system_theme().cosmic();
+    // Window picker mode has no persistent selected area of its own, so there
+    // is nothing for Translate to repaint there.
+    let translate_enabled = match &args.choice {
+        Choice::Rectangle(rect, _) => rect.dimensions().is_some(),
+        Choice::Output(_) => true,
+        Choice::Window(..) => false,
+    };
     KeyboardWrapper::new(
         crate::widget::screenshot::ScreenshotSelection::new(
             args.choice.clone(),
@@ -610,6 +693,17 @@ pub(crate) fn view(portal: &CosmicPortal, id: window::Id) -> cosmic::Element<'_,
             &portal.location_options,
             args.location as usize,
             Msg::Location,
+            TranslateControls {
+                languages: lang::LANGS,
+                selected: args.target_index,
+                busy: args.translating,
+                enabled: translate_enabled,
+                status: args.status.as_deref(),
+                on_translate: Msg::Translate {
+                    output: output.name.clone(),
+                },
+                on_language: Box::new(Msg::TargetLanguage),
+            },
             theme.spacing,
             i as u128,
         ),
@@ -817,7 +911,7 @@ pub fn update_msg(
                     config::screenshot::Screenshot {
                         choice,
                         last_rectangle: last_rect,
-                        ..portal.config.screenshot
+                        ..portal.config.screenshot.clone()
                     },
                 ))
             } else {
@@ -871,6 +965,7 @@ pub fn update_msg(
                         save_location: loc,
                         choice: (&mut portal.config.screenshot.choice).into(),
                         last_rectangle: portal.config.screenshot.last_rectangle,
+                        target_language: portal.config.screenshot.target_language.clone(),
                     },
                 ))
             } else {
@@ -878,6 +973,225 @@ pub fn update_msg(
                 cosmic::Task::none()
             }
         }
+        Msg::TargetLanguage(index) => {
+            // Remember the pick the moment it is made: an aborted or failed
+            // translate must not lose it, and the next dialog opens on it.
+            let Some(next) = language_pick(&portal.config.screenshot, index) else {
+                tracing::error!("TargetLanguage index {index} is outside the language table.");
+                return cosmic::Task::none();
+            };
+            if let Some(args) = portal.screenshot_args.as_mut() {
+                args.target_index = index;
+            } else {
+                tracing::error!("Failed to find screenshot Args for TargetLanguage message.");
+            }
+            // Write now, not through a `ConfigSetScreenshot` task: the setter
+            // ignores a value equal to the in-memory config, and this arm used
+            // to assign `next` first, so the pick never reached the file even
+            // though it did take effect in memory. Let the setter install it.
+            portal.save_screenshot_config(next);
+            cosmic::Task::none()
+        }
+        Msg::Translate { output } => {
+            if portal.screenshot_args.is_none() {
+                tracing::error!("Failed to find screenshot Args for Translate message.");
+                return cosmic::Task::none();
+            }
+            if portal
+                .screenshot_args
+                .as_ref()
+                .is_some_and(|args| args.translating)
+            {
+                return cosmic::Task::none();
+            }
+
+            // Resolve the same area Capture would export: the chosen output
+            // whole, or the drawn rectangle clipped to the output this dialog
+            // belongs to. `output` is the dialog's own output; a rectangle is
+            // drawn in that output's view.
+            let choice = portal
+                .screenshot_args
+                .as_ref()
+                .map(|args| args.choice.clone());
+            let (name, selection) = match choice {
+                Some(Choice::Output(name)) => (name, None),
+                Some(Choice::Rectangle(rect, _)) => (output, Some(rect)),
+                Some(Choice::Window(..)) => {
+                    set_status(
+                        portal,
+                        Some(
+                            "Translate works in area or screen mode; pick an area first"
+                                .to_string(),
+                        ),
+                    );
+                    return cosmic::Task::none();
+                }
+                _ => return cosmic::Task::none(),
+            };
+
+            let Some(base) = portal
+                .screenshot_args
+                .as_ref()
+                .and_then(|args| args.pristine.get(&name).cloned())
+            else {
+                set_status(
+                    portal,
+                    Some("the capture for this screen is no longer available".to_string()),
+                );
+                return cosmic::Task::none();
+            };
+
+            let Some(output_state) = portal.outputs.iter().find(|state| state.name == name) else {
+                set_status(
+                    portal,
+                    Some("this screen is no longer connected".to_string()),
+                );
+                return cosmic::Task::none();
+            };
+            let output_rect = LogicalRect {
+                left: output_state.logical_pos.0,
+                top: output_state.logical_pos.1,
+                right: output_state.logical_pos.0 + output_state.logical_size.0 as i32,
+                bottom: output_state.logical_pos.1 + output_state.logical_size.1 as i32,
+            };
+            let dimensions = base.dimensions();
+            let region = match selection {
+                Some(rect) => translate::region_for_selection(
+                    LogicalRect {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    },
+                    output_rect,
+                    dimensions,
+                ),
+                None => Some(Region::whole(dimensions)),
+            };
+            let Some(region) = region else {
+                set_status(portal, Some("select an area to translate".to_string()));
+                return cosmic::Task::none();
+            };
+
+            let Some(target) = portal.screenshot_args.as_ref().map(|args| args.target()) else {
+                return cosmic::Task::none();
+            };
+            if let Some(args) = portal.screenshot_args.as_mut() {
+                args.translating = true;
+                args.status = None;
+            }
+
+            // OCR and the HTTP call take seconds; they run off the UI thread so
+            // the dialog stays responsive and a slow sidecar never freezes it.
+            cosmic::Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || translate::run(name, base, region, target))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("the translation task failed: {error}"))
+                        })
+                },
+                |result| cosmic::Action::App(crate::app::Msg::Screenshot(Msg::Translated(result))),
+            )
+        }
+        Msg::Translated(result) => {
+            let Some(args) = portal.screenshot_args.as_mut() else {
+                tracing::error!("Failed to find screenshot Args for Translated message.");
+                return cosmic::Task::none();
+            };
+            args.translating = false;
+            match result {
+                Ok(done) => {
+                    let Some(base) = args.pristine.get(&done.output) else {
+                        args.status =
+                            Some("the capture for this screen is no longer available".to_string());
+                        return cosmic::Task::none();
+                    };
+                    // Composite first, then swap the buffer: the dialog never
+                    // shows or exports a half-painted image.
+                    let composited = translate::composite(base, &done);
+                    // Opt-in ground truth: the full capture as the dialog
+                    // would export it, beside the OCR dumps of the same run.
+                    if let Some(dir) = &done.debug_dir {
+                        let _ = composited.save(dir.join("composite.png"));
+                    }
+                    let (width, height) = composited.dimensions();
+                    let handle = cosmic::widget::image::Handle::from_rgba(
+                        width,
+                        height,
+                        composited.as_raw().clone(),
+                    );
+                    // Counts, not a verdict: one line translated out of ten
+                    // must not read as a success, and a run that painted
+                    // nothing says why. Built before `done.output` is moved
+                    // into the image map below.
+                    let status = status_line(&done);
+                    args.output_images.insert(
+                        done.output,
+                        ScreenshotImage {
+                            rgba: composited,
+                            handle,
+                        },
+                    );
+                    args.status = Some(status);
+                }
+                Err(message) => args.status = Some(message),
+            }
+            cosmic::Task::none()
+        }
+    }
+}
+
+/// The one line under the toolbar after a run, from the run's own counts.
+///
+/// Counts, not a verdict: one line translated out of ten must not read as a
+/// success, and a run that painted nothing says why. `recovered` is named
+/// separately because those lines came from the opposite-polarity retry — the
+/// reading was not the crop's own polarity, and the user should be able to see
+/// that from the dialog rather than only in a debug trace.
+fn status_line(done: &translate::Translated) -> String {
+    if done.same_language {
+        return format!(
+            "this looks like {} already — pick another target language in the toolbar",
+            done.target.name
+        );
+    }
+    if done.kept == 0 {
+        return if done.found == 0 {
+            "no text found in the selected area — nothing to translate".to_string()
+        } else {
+            format!(
+                "found {} line(s) but none readable — nothing translated",
+                done.found
+            )
+        };
+    }
+    if done.translated == 0 && done.drawn == 0 && done.skipped_code > 0 {
+        return format!(
+            "the selection is code — {} line(s) left as they are",
+            done.skipped_code
+        );
+    }
+    let mut line = format!(
+        "{} → {} · found {}, kept {}, translated {}, drawn {}",
+        done.source, done.target.name, done.found, done.kept, done.translated, done.drawn
+    );
+    if done.recovered > 0 {
+        line.push_str(&format!(
+            " · {} recovered from the opposite polarity",
+            done.recovered
+        ));
+    }
+    if done.skipped_code > 0 {
+        line.push_str(&format!(" · {} code line(s) left as-is", done.skipped_code));
+    }
+    line
+}
+
+/// Set the one-line feedback under the toolbar, if the dialog still exists.
+fn set_status(portal: &mut CosmicPortal, status: Option<String>) {
+    if let Some(args) = portal.screenshot_args.as_mut() {
+        args.status = status;
     }
 }
 
@@ -896,6 +1210,7 @@ pub fn update_args(
         action,
         location,
         toplevel_images,
+        ..
     } = &args;
 
     if portal.outputs.len() != images.len() {
@@ -983,5 +1298,216 @@ pub fn update_args(
     } else {
         tracing::info!("Existing screenshot args updated");
         cosmic::Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real `cosmic_config::Config` rooted in a throwaway directory, so the
+    /// tests write and re-read the same key the running portal uses.
+    fn temp_config() -> (tempfile::TempDir, cosmic::cosmic_config::Config) {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let handler = cosmic::cosmic_config::Config::with_custom_path(
+            config::APP_ID,
+            config::CONFIG_VERSION,
+            dir.path().to_path_buf(),
+        )
+        .expect("temp config handler");
+        (dir, handler)
+    }
+
+    /// The key file under the temp config dir (`…/v1/screenshot`).
+    fn screenshot_key(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path()
+            .join("cosmic")
+            .join(config::APP_ID)
+            .join(format!("v{}", config::CONFIG_VERSION))
+            .join("screenshot")
+    }
+
+    /// Re-read what a running portal would see after a restart.
+    fn reload(handler: &cosmic::cosmic_config::Config) -> config::Config {
+        config::Config::get_entry(handler).expect("config reads back")
+    }
+
+    fn german() -> usize {
+        lang::LANGS
+            .iter()
+            .position(|row| row.code == "de")
+            .expect("German is in the table")
+    }
+
+    /// A portal with just enough state for the config messages. No screenshot
+    /// args: the arm logs that, but the save must happen regardless.
+    fn test_portal(handler: cosmic::cosmic_config::Config) -> CosmicPortal {
+        CosmicPortal {
+            core: cosmic::app::Core::default(),
+            tx: None,
+            config_handler: Some(handler),
+            config: config::Config::default(),
+            access_args: None,
+            file_choosers: Default::default(),
+            screenshot_args: None,
+            screencast_args: None,
+            screencast_tab_model: Default::default(),
+            remote_desktop_args: None,
+            location_options: Vec::new(),
+            prev_rectangle: None,
+            wayland_helper: None,
+            outputs: Vec::new(),
+            active_output: None,
+            dummy_id: window::Id::unique(),
+        }
+    }
+
+    #[test]
+    fn picking_a_language_writes_it_to_the_config_file() {
+        let (dir, handler) = temp_config();
+        let mut portal = test_portal(handler.clone());
+
+        let _ = update_msg(&mut portal, Msg::TargetLanguage(german()));
+
+        // The dialog keeps it in memory for the rest of this dialog…
+        assert_eq!(
+            portal.config.screenshot.target_language.as_deref(),
+            Some("de")
+        );
+        // …and the pick is on disk, which is what the next dialog and a
+        // restart read. This is the assertion the old code failed: the
+        // in-memory copy was assigned first, so `set_screenshot` saw no change
+        // and wrote nothing.
+        assert_eq!(
+            reload(&handler).screenshot.target_language.as_deref(),
+            Some("de")
+        );
+        let raw = std::fs::read_to_string(screenshot_key(&dir)).expect("screenshot key written");
+        assert!(
+            raw.contains(r#"target_language: Some("de")"#),
+            "language missing from {raw}"
+        );
+    }
+
+    #[test]
+    fn a_choice_save_after_the_pick_keeps_the_language() {
+        let (dir, handler) = temp_config();
+        let mut portal = test_portal(handler.clone());
+        let _ = update_msg(&mut portal, Msg::TargetLanguage(german()));
+
+        // Exactly what `Msg::Choice`/`Msg::Location` hand to the runtime: the
+        // whole struct, rebuilt from the in-memory copy, through the same
+        // `Msg::ConfigSetScreenshot` arm they use. A stale copy would resurrect
+        // `None` here.
+        use cosmic::Application as _;
+        let save = config::screenshot::Screenshot {
+            choice: config::screenshot::Choice::Rectangle,
+            last_rectangle: portal.config.screenshot.last_rectangle,
+            ..portal.config.screenshot.clone()
+        };
+        let _ = portal.update(crate::app::Msg::ConfigSetScreenshot(save));
+
+        let stored = reload(&handler).screenshot;
+        assert_eq!(stored.target_language.as_deref(), Some("de"));
+        assert_eq!(stored.choice, config::screenshot::Choice::Rectangle);
+
+        let raw = std::fs::read_to_string(screenshot_key(&dir)).expect("screenshot key written");
+        assert!(
+            raw.contains(r#"target_language: Some("de")"#),
+            "language dropped by a later save: {raw}"
+        );
+    }
+
+    #[test]
+    fn an_index_outside_the_table_writes_nothing() {
+        let (dir, handler) = temp_config();
+        let mut portal = test_portal(handler);
+
+        let _ = update_msg(&mut portal, Msg::TargetLanguage(lang::LANGS.len()));
+
+        assert_eq!(portal.config.screenshot.target_language, None);
+        assert!(!screenshot_key(&dir).exists(), "nothing should be written");
+    }
+
+    #[test]
+    fn the_dialog_opens_on_the_language_last_picked() {
+        let german = lang::LANGS
+            .iter()
+            .position(|row| row.code == "de")
+            .expect("German is in the table");
+        assert_eq!(target_index(Some("de")), german);
+        assert_eq!(
+            target_index(Some("ja")),
+            lang::LANGS.iter().position(|row| row.code == "ja").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_stale_or_missing_language_falls_back_to_a_valid_index() {
+        // A code that is no longer in the table must not become a stale index.
+        for stored in [None, Some("tlh"), Some(""), Some("DE")] {
+            let index = target_index(stored);
+            assert!(index < lang::LANGS.len(), "{stored:?} -> {index}");
+        }
+    }
+
+    /// A finished run, for the status-line tests: only the counts matter.
+    fn finished_run(
+        found: usize,
+        kept: usize,
+        translated: usize,
+        drawn: usize,
+        recovered: usize,
+        skipped_code: usize,
+    ) -> translate::Translated {
+        translate::Translated {
+            output: "DP-1".into(),
+            region: Region {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            image: std::sync::Arc::new(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([0, 0, 0, 255]),
+            )),
+            target: lang::find("en").expect("English is in the table"),
+            source: "German".into(),
+            found,
+            kept,
+            translated,
+            drawn,
+            recovered,
+            skipped_code,
+            same_language: false,
+            debug_dir: None,
+        }
+    }
+
+    #[test]
+    fn the_status_line_names_the_lines_recovered_from_the_opposite_polarity() {
+        let line = status_line(&finished_run(9, 6, 6, 6, 2, 0));
+        assert_eq!(
+            line,
+            "German → English · found 9, kept 6, translated 6, drawn 6 · 2 recovered from the opposite polarity",
+            "the retry's lines are named, not folded into `kept`"
+        );
+
+        // A run that needed no retry keeps the plain line: no empty clause.
+        let plain = status_line(&finished_run(9, 6, 6, 6, 0, 0));
+        assert_eq!(
+            plain,
+            "German → English · found 9, kept 6, translated 6, drawn 6"
+        );
+        assert!(!plain.contains("recovered"), "no clause when nothing was");
+
+        // Both asides can appear, recovered first — the order `counts()` uses.
+        let both = status_line(&finished_run(9, 6, 6, 6, 1, 2));
+        assert!(
+            both.ends_with("· 1 recovered from the opposite polarity · 2 code line(s) left as-is"),
+            "{both}"
+        );
     }
 }

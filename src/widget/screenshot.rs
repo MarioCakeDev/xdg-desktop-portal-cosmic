@@ -12,9 +12,10 @@ use cosmic::iced::core::{
 };
 use cosmic::iced::{self, window};
 use cosmic::widget::{
-    self, button, divider, dropdown, icon, image, layer_container, row, space, svg, text,
+    self, button, column, divider, dropdown, icon, image, layer_container, row, space, svg, text,
 };
 use cosmic_bg_config::Source;
+use cosmic_screenshot_engine::lang::LangInfo;
 use wayland_client::protocol::wl_output::WlOutput;
 
 use crate::app::OutputState;
@@ -23,6 +24,24 @@ use crate::screenshot::{Choice, Rect, ScreenshotImage};
 
 use super::output_selection::OutputSelection;
 use super::rectangle_selection::{DragState, RectangleSelection};
+
+/// The Translate button and its target-language picker, which sit in the same
+/// toolbar as Capture and the save destination.
+pub struct TranslateControls<'a, Msg> {
+    /// The language table, shared with the CLI (`crates/engine/src/lang.rs`).
+    pub languages: &'static [LangInfo],
+    pub selected: usize,
+    /// A translation is running: the button says so and cannot be pressed.
+    pub busy: bool,
+    /// There is an area that can be translated (a drawn rectangle, or a whole
+    /// output). Window picker mode has none.
+    pub enabled: bool,
+    /// One line of feedback under the toolbar: the result, or the reason it
+    /// failed. Never more than one line.
+    pub status: Option<&'a str>,
+    pub on_translate: Msg,
+    pub on_language: Box<dyn Fn(usize) -> Msg + 'a>,
+}
 
 pub struct ScreenshotSelection<'a, Msg> {
     id: cosmic::widget::Id,
@@ -74,6 +93,7 @@ where
         save_locations: &'a Vec<String>,
         selected_save_location: usize,
         dropdown_selected: impl Fn(usize) -> Msg + 'static + Clone,
+        translate: TranslateControls<'a, Msg>,
         spacing: Spacing,
         dnd_id: u128,
     ) -> Self {
@@ -81,6 +101,16 @@ where
         let space_s = spacing.space_s;
         let space_xs = spacing.space_xs;
         let space_xxs = spacing.space_xxs;
+
+        let TranslateControls {
+            languages,
+            selected: selected_language,
+            busy: translating,
+            enabled: translate_enabled,
+            status: translate_status,
+            on_translate,
+            on_language,
+        } = translate;
 
         let output_rect = Rect {
             left: output.logical_pos.0,
@@ -202,6 +232,116 @@ where
         let active_icon = cosmic::theme::Svg::Custom(Rc::new(|t| svg::Style {
             color: Some(t.cosmic().accent_color().into()),
         }));
+
+        // The Translate button sits with the other screenshot actions, and the
+        // language picker right next to it. Both are inert while a translation
+        // is running so the picture cannot be repainted twice.
+        let translate_button = button::custom(text(if translating {
+            fl!("translating")
+        } else {
+            fl!("translate")
+        }))
+        .on_press_maybe((translate_enabled && !translating).then_some(on_translate));
+        let language_picker = Element::from(dropdown(
+            languages,
+            Some(selected_language),
+            |index| index,
+        ))
+        .map(on_language);
+
+        let toolbar = row![
+            row![
+                button::custom(
+                    icon::Icon::from(icon::from_name("screenshot-selection-symbolic").size(64))
+                        .width(Length::Fixed(40.0))
+                        .height(Length::Fixed(40.0))
+                        .class(
+                            if matches!(choice, Choice::Rectangle(..)) {
+                                active_icon.clone()
+                            } else {
+                                cosmic::theme::Svg::default()
+                            }
+                        )
+                )
+                .selected(matches!(choice, Choice::Rectangle(..)))
+                .class(cosmic::theme::Button::Icon)
+                .on_press(on_choice_change(Choice::Rectangle(
+                    Rect::default(),
+                    DragState::None
+                )))
+                .padding(space_xs),
+                button::custom(
+                    icon::Icon::from(icon::from_name("screenshot-window-symbolic").size(64))
+                        .class(if matches!(choice, Choice::Window(..)) {
+                            active_icon.clone()
+                        } else {
+                            cosmic::theme::Svg::default()
+                        })
+                        .width(Length::Fixed(40.0))
+                        .height(Length::Fixed(40.0))
+                )
+                .selected(matches!(choice, Choice::Window(..)))
+                .class(cosmic::theme::Button::Icon)
+                .on_press(on_choice_change(Choice::Window(output.name.clone(), None)))
+                .padding(space_xs),
+                button::custom(
+                    icon::Icon::from(icon::from_name("screenshot-screen-symbolic").size(64))
+                        .width(Length::Fixed(40.0))
+                        .height(Length::Fixed(40.0))
+                        .class(if matches!(choice, Choice::Output(..)) {
+                            active_icon.clone()
+                        } else {
+                            cosmic::theme::Svg::default()
+                        })
+                )
+                .selected(matches!(choice, Choice::Output(..)))
+                .class(cosmic::theme::Button::Icon)
+                .on_press(on_choice_change(Choice::Output(output.name.clone())))
+                .padding(space_xs)
+            ]
+            .spacing(space_s)
+            .align_y(Alignment::Center),
+            divider::vertical::light().height(Length::Fixed(64.0)),
+            button::custom(text(fl!("capture"))).on_press_maybe(
+                if let Choice::Rectangle(r, ..) = choice {
+                    // Disable button on empty selection
+                    r.dimensions().is_some().then_some(on_capture)
+                } else {
+                    Some(on_capture)
+                }
+            ),
+            divider::vertical::light().height(Length::Fixed(64.0)),
+            translate_button,
+            language_picker,
+            divider::vertical::light().height(Length::Fixed(64.0)),
+            Element::from(dropdown(
+                save_locations.as_slice(),
+                Some(selected_save_location),
+                |i| i
+            ))
+            .map(dropdown_selected),
+            divider::vertical::light().height(Length::Fixed(64.0)),
+            button::custom(
+                icon::Icon::from(icon::from_name("window-close-symbolic").size(63))
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0))
+            )
+            .class(cosmic::theme::Button::Icon)
+            .on_press(on_cancel),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(space_s);
+
+        // One line of feedback, plus its own line so a success or a failure
+        // never widens the toolbar itself. Nothing else changes in the dialog.
+        let menu_content: Element<'a, Msg> = match translate_status {
+            Some(status) => column![toolbar, text(status)]
+                .spacing(space_xxs)
+                .align_x(Alignment::Center)
+                .into(),
+            None => toolbar.into(),
+        };
+
         Self {
             id: cosmic::widget::Id::unique(),
             choices: Vec::new(),
@@ -209,112 +349,24 @@ where
             choice_labels: Vec::new(),
             bg_element,
             fg_element,
-            menu_element: cosmic::widget::container(
-                row![
-                    row![
-                        button::custom(
-                            icon::Icon::from(
-                                icon::from_name("screenshot-selection-symbolic").size(64)
-                            )
-                            .width(Length::Fixed(40.0))
-                            .height(Length::Fixed(40.0))
-                            .class(
-                                if matches!(choice, Choice::Rectangle(..)) {
-                                    active_icon.clone()
-                                } else {
-                                    cosmic::theme::Svg::default()
-                                }
-                            )
-                        )
-                        .selected(matches!(choice, Choice::Rectangle(..)))
-                        .class(cosmic::theme::Button::Icon)
-                        .on_press(on_choice_change(Choice::Rectangle(
-                            Rect::default(),
-                            DragState::None
-                        )))
-                        .padding(space_xs),
-                        button::custom(
-                            icon::Icon::from(
-                                icon::from_name("screenshot-window-symbolic").size(64)
-                            )
-                            .class(if matches!(choice, Choice::Window(..)) {
-                                active_icon.clone()
-                            } else {
-                                cosmic::theme::Svg::default()
-                            })
-                            .width(Length::Fixed(40.0))
-                            .height(Length::Fixed(40.0))
-                        )
-                        .selected(matches!(choice, Choice::Window(..)))
-                        .class(cosmic::theme::Button::Icon)
-                        .on_press(on_choice_change(Choice::Window(output.name.clone(), None)))
-                        .padding(space_xs),
-                        button::custom(
-                            icon::Icon::from(
-                                icon::from_name("screenshot-screen-symbolic").size(64)
-                            )
-                            .width(Length::Fixed(40.0))
-                            .height(Length::Fixed(40.0))
-                            .class(
-                                if matches!(choice, Choice::Output(..)) {
-                                    active_icon.clone()
-                                } else {
-                                    cosmic::theme::Svg::default()
-                                }
-                            )
-                        )
-                        .selected(matches!(choice, Choice::Output(..)))
-                        .class(cosmic::theme::Button::Icon)
-                        .on_press(on_choice_change(Choice::Output(output.name.clone())))
-                        .padding(space_xs)
-                    ]
-                    .spacing(space_s)
-                    .align_y(Alignment::Center),
-                    divider::vertical::light().height(Length::Fixed(64.0)),
-                    button::custom(text(fl!("capture"))).on_press_maybe(
-                        if let Choice::Rectangle(r, ..) = choice {
-                            // Disable button on empty selection
-                            r.dimensions().is_some().then_some(on_capture)
-                        } else {
-                            Some(on_capture)
-                        }
-                    ),
-                    divider::vertical::light().height(Length::Fixed(64.0)),
-                    Element::from(dropdown(
-                        save_locations.as_slice(),
-                        Some(selected_save_location),
-                        |i| i
-                    ))
-                    .map(dropdown_selected),
-                    divider::vertical::light().height(Length::Fixed(64.0)),
-                    button::custom(
-                        icon::Icon::from(icon::from_name("window-close-symbolic").size(63))
-                            .width(Length::Fixed(40.0))
-                            .height(Length::Fixed(40.0))
-                    )
-                    .class(cosmic::theme::Button::Icon)
-                    .on_press(on_cancel),
-                ]
-                .align_y(Alignment::Center)
-                .spacing(space_s)
-                .padding([space_xxs, space_s, space_xxs, space_s]),
-            )
-            .class(cosmic::theme::Container::Custom(Box::new(|theme| {
-                let cosmic = theme.cosmic();
-                cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(
-                        // TODO support blur effect in iced?
-                        cosmic.background(false).component.base.into(),
-                    )),
-                    text_color: Some(cosmic.background(false).component.on.into()),
-                    border: Border {
-                        radius: cosmic.corner_radii.radius_s.into(),
+            menu_element: cosmic::widget::container(menu_content)
+                .padding([space_xxs, space_s, space_xxs, space_s])
+                .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+                    let cosmic = theme.cosmic();
+                    cosmic::iced::widget::container::Style {
+                        background: Some(Background::Color(
+                            // TODO support blur effect in iced?
+                            cosmic.background(false).component.base.into(),
+                        )),
+                        text_color: Some(cosmic.background(false).component.on.into()),
+                        border: Border {
+                            radius: cosmic.corner_radii.radius_s.into(),
+                            ..Default::default()
+                        },
                         ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            })))
-            .into(),
+                    }
+                })))
+                .into(),
             choice,
         }
     }

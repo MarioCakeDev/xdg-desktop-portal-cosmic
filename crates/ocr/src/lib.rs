@@ -1,0 +1,2409 @@
+//! VENDORED — do not edit here.
+//!
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at b39cc37678c31ac715f22ccd49d1bdba39cc04cd (crates/ocr).
+//! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
+//!
+//! OCR of a captured region.
+//!
+//! Uses the `tesseract` CLI rather than a native binding: no leptonica build
+//! step, the language packs are ordinary apt packages, and the process boundary
+//! keeps a misbehaving OCR run from taking the UI with it. The TSV parser is
+//! pure so it is tested against fixtures.
+//!
+//! A screenshot is not a document. The defaults are tuned for one: the crop is
+//! binarised before recognition (grey, histogram stretch, polarity normalised,
+//! hard threshold), because game UI is anti-aliased light text on a dark panel
+//! and Tesseract reads the soft edges as strokes — `Advancements` comes back as
+//! `AYancernrentS` on the raw pixels; the crop is then enlarged with nearest
+//! neighbour, because the font is already a bitmap and interpolation only
+//! blurs its strokes; one uniform-block pass (6) reads it, with a sparse-text
+//! pass (11) only when that keeps fewer than two lines; and a line made mostly
+//! of punctuation is dropped instead of being handed to the translator.
+//!
+//! Paint boxes are built from **words**, never from Tesseract's line box. A
+//! line box can start at a button's border glyph and can span two columns:
+//! painting it covers art and drops the translation far left of its label.
+//! Words with no letters are dropped, the rest are clustered by horizontal gap,
+//! and each cluster is translated and painted on its own.
+//!
+//! One crop gets one polarity, and a capture can hold both themes: a selected
+//! passage is a light block inside a dark page, so the crop's paper names the
+//! page and the whole passage is folded into the background by the split. The
+//! rows no recognised block covers that hold a flat area of the other colour
+//! are read once more, with the polarity flipped, and only the lines inside
+//! that band are kept ([`unread_bands`]). A busy region — a photo, an avatar —
+//! rarely forms such a band, and when it does nothing from it survives unless
+//! its inverted pixels read as credible text: the caps and the flatness test
+//! keep the retry to a flat block, the credibility filter keeps the output.
+//!
+//! Nothing here invents text: every block comes from a Tesseract pass over the
+//! pixels, and the optional corrector in [`spellfix`] only replaces a token
+//! with a vocabulary word that is one or two edits away.
+
+mod spellfix;
+
+use std::collections::HashMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use image::imageops::FilterType;
+
+pub use spellfix::Correction;
+
+/// Every language pack the tool is prepared to read. The install recipe ships
+/// all of them; a narrower set can be selected with
+/// `COSMIC_SCREENSHOT_OCR_LANGS=eng+deu` (faster on a small region).
+pub const ALL_LANGUAGES: &str = "eng+deu+fra+spa+ita+por+nld+pol+rus+ukr+tur+ces+swe+dan+fin+ell+hun+ron+ind+jpn+chi_sim+chi_tra+kor+ara";
+
+pub const LANGUAGES_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_LANGS";
+
+/// Opt-in dump of everything one run handed to Tesseract, plus the TSV it
+/// returned. Set it to a directory; each translation gets its own `run-*`
+/// subdirectory there.
+pub const DEBUG_DIR_VARIABLE: &str = "COSMIC_SCREENSHOT_DEBUG_DIR";
+
+/// Pin one page segmentation mode instead of the built-in default and its
+/// short-read fallback. Mostly for tuning against a capture.
+pub const PSM_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_PSM";
+
+/// Enlargement factor applied before recognition (`1` disables it).
+pub const SCALE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_SCALE";
+
+/// Set to `0`/`false`/`off` to hand Tesseract the greyscale crop instead of a
+/// binarised one. On by default: binarisation is what makes a game menu
+/// readable at all.
+pub const BINARIZE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_BINARIZE";
+
+/// Luma split point for the binarised crop (`1`–`254`), after the crop has been
+/// normalised to dark ink on light paper. Raise it for a dim capture, lower it
+/// when panel shading bleeds into the glyphs.
+pub const THRESHOLD_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_THRESHOLD";
+
+/// Set to `0`/`false`/`off` to hand the translator exactly what Tesseract read,
+/// without the small UI-vocabulary corrector.
+pub const SPELLFIX_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_SPELLFIX";
+
+/// Light UI text on a dark panel separates cleanly at 150.
+pub const DEFAULT_THRESHOLD: u8 = 150;
+
+/// Below this mean word confidence a line is dropped.
+pub const DEFAULT_MIN_CONFIDENCE: f32 = 30.0;
+
+/// Screenshot default: one uniform-block pass (psm 6). On a binarised menu it
+/// reads the labels in ~300 ms; a tournament of page segmentation modes costs
+/// six seconds and reads no better.
+const DEFAULT_PSM: u8 = 6;
+
+/// Only tried when the default pass keeps fewer than two lines.
+const FALLBACK_PSMS: [u8; 1] = [11];
+
+/// Fewer kept lines than this is not a reading worth trusting.
+const FALLBACK_BELOW_LINES: usize = 2;
+
+/// One crop gets one polarity; a flat block on the other side of it is read
+/// again from its own rows. At most this many bands per crop — the tallest are
+/// kept, in page order, because a page that splits into many narrow strips (a
+/// two-column layout) is one of the cases this retry exists for.
+const MAX_RETRY_BANDS: usize = 4;
+
+/// Shorter than this (in capture pixels) is not a line of text. The band is
+/// measured in prepared rows, so the floor scales with the image: at 2× it is
+/// 16 prepared rows, and a sliver of antialiasing does not count as a passage.
+const MIN_BAND_ROWS: u32 = 8;
+
+/// How far a row's opposite-pixel colour may drift and stay one band.
+const BAND_FLATNESS: f32 = 16.0;
+
+/// Rows of margin above and below a band, so ascenders and descenders are not
+/// clipped. [`Prepared::band_crop`] returns the row it started at, so the
+/// caller maps Tesseract's rows back through the margin.
+const BAND_MARGIN: u32 = 4;
+
+/// Share of a row that must be on the opposite side of the paper before the
+/// row's colour is worth taking: enough pixels for a mode, and no more.
+const BAND_MIN_SHARE: f32 = 0.05;
+
+/// The unbroken run of other-paper pixels a row needs to count as paper rather
+/// than ink, as a share of the row's width.
+///
+/// This is what tells a passage from the page's own ink, and a luma distance
+/// from the paper cannot: light text on a dark page sits on the far side of
+/// the split too. Ink is strokes — runs of a few pixels, each broken by the
+/// page's paper — while a passage's rows are one run of its own paper.
+///
+/// One such row is not enough: a rule or an underline under a line of ink is a
+/// long run too. [`push_band`] therefore wants a quarter of a band's rows to
+/// clear this, because paper in a passage is an *area* — padding above and
+/// below, and the rows between its lines. The assumption this encodes is that
+/// the passage has that padding; a block cropped flush to its glyphs, with no
+/// paper row at all, is not retried and keeps its pixels.
+const BAND_MIN_RUN_SHARE: f32 = 0.15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bbox {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Bbox {
+    pub fn right(&self) -> u32 {
+        self.x + self.width
+    }
+
+    pub fn bottom(&self) -> u32 {
+        self.y + self.height
+    }
+
+    fn union(&mut self, other: Bbox) {
+        let left = self.x.min(other.x);
+        let top = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        self.x = left;
+        self.y = top;
+        self.width = right - left;
+        self.height = bottom - top;
+    }
+
+    /// Map a box from the enlarged image back to the capture's pixels.
+    fn scaled(self, factor: u32) -> Self {
+        if factor <= 1 {
+            return self;
+        }
+        let factor = factor as f32;
+        let scale = |value: u32| ((value as f32 / factor).round() as u32).max(1);
+        Self {
+            x: (self.x as f32 / factor).round() as u32,
+            y: (self.y as f32 / factor).round() as u32,
+            width: scale(self.width),
+            height: scale(self.height),
+        }
+    }
+}
+
+/// One recognised line of text and where it sits in the image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextBlock {
+    pub bbox: Bbox,
+    pub text: String,
+    /// Tesseract's mean word confidence, 0–100.
+    pub confidence: f32,
+}
+
+/// What one Tesseract pass found, before and after the credibility filter.
+#[derive(Clone, Debug, Default)]
+pub struct Attempt {
+    pub psm: u8,
+    /// Lines Tesseract emitted.
+    pub found: usize,
+    /// Lines kept after confidence and readability filtering.
+    pub kept: usize,
+    pub mean_confidence: f32,
+    pub elapsed_ms: u128,
+}
+
+/// The reading the pipeline should use, plus the counts a status line needs.
+#[derive(Clone, Debug, Default)]
+pub struct Reading {
+    /// Credible lines, in reading order, in the capture's coordinates.
+    pub blocks: Vec<TextBlock>,
+    /// Lines Tesseract emitted across the chosen pass.
+    pub found: usize,
+    pub dropped_low_confidence: usize,
+    pub dropped_unreadable: usize,
+    /// The segmentation mode that produced `blocks`.
+    pub psm: u8,
+    pub languages: String,
+    /// Enlargement applied before recognition.
+    pub scale: u32,
+    pub elapsed_ms: u128,
+    /// Every reading of this image that was tried.
+    pub attempts: Vec<Attempt>,
+    /// Tokens the UI corrector replaced, in the order it fired.
+    pub corrections: Vec<Correction>,
+    /// Lines recovered by reading a band again with the opposite polarity.
+    pub recovered: usize,
+}
+
+impl Reading {
+    pub fn kept(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn mean_confidence(&self) -> f32 {
+        if self.blocks.is_empty() {
+            return 0.0;
+        }
+        let total: f32 = self.blocks.iter().map(|block| block.confidence).sum();
+        total / self.blocks.len() as f32
+    }
+
+    pub fn texts(&self) -> Vec<&str> {
+        self.blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect()
+    }
+}
+
+/// An opt-in debug dump directory for one translation run.
+///
+/// `COSMIC_SCREENSHOT_DEBUG_DIR=/tmp/ocr` creates
+/// `/tmp/ocr/run-<millis>-<pid>-<n>/` and every OCR pass writes the exact image
+/// it handed to Tesseract plus the raw TSV it got back. The engine writes the
+/// final painted crop and a report beside them.
+#[derive(Clone, Debug)]
+pub struct Debug {
+    dir: PathBuf,
+    label: String,
+}
+
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
+impl Debug {
+    /// A fresh run directory, or `None` when the variable is unset or the
+    /// directory cannot be created. A missing dump must never fail a capture.
+    pub fn from_env() -> Option<Self> {
+        Self::in_directory(std::env::var(DEBUG_DIR_VARIABLE).ok()?)
+    }
+
+    pub fn in_directory(raw: impl AsRef<str>) -> Option<Self> {
+        let raw = raw.as_ref().trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let run = RUNS.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(raw).join(format!("run-{millis}-{}-{run}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Self {
+            dir,
+            label: "ocr".to_string(),
+        })
+    }
+
+    /// Name this pass (`probe`, `main`, …) so several dumps in one run sort
+    /// and read clearly.
+    pub fn labelled(&self, label: impl Into<String>) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            label: label.into(),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn path(&self, suffix: &str) -> PathBuf {
+        self.dir.join(format!("{}-{suffix}", self.label))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub binary: PathBuf,
+    /// Tesseract `-l` value, e.g. `eng+deu`.
+    pub languages: String,
+    /// A pinned page segmentation mode; `None` runs the screenshot default and
+    /// its single short-read fallback.
+    pub psm: Option<u8>,
+    /// Enlargement before recognition. Tesseract is happiest around 30 px cap
+    /// height; ordinary game UI is not.
+    pub scale: u32,
+    /// Greyscale, stretch the histogram, then split at [`Config::threshold`]
+    /// before recognition. The same crop that reads `AYancernrentS` raw reads
+    /// `Advancements` binarised, at a twentieth of the cost of extra passes.
+    pub binarize: bool,
+    /// Luma split point for [`Config::binarize`], `1..=254`.
+    pub threshold: u8,
+    /// Repair tokens that are one or two edits from a known UI word. Off
+    /// leaves the translator with exactly what Tesseract read.
+    pub spellfix: bool,
+    /// Lines below this mean confidence are dropped.
+    pub min_confidence: f32,
+    /// Read a flat band whose paper is opposite the crop's own polarity again,
+    /// with the polarity flipped, so a selected passage inside a dark page is
+    /// not folded into the background by the global decision.
+    pub retry_opposite_polarity: bool,
+    /// When set, write the OCR input and the raw TSV under this directory.
+    pub debug: Option<Debug>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("tesseract"),
+            languages: ALL_LANGUAGES.to_string(),
+            psm: None,
+            scale: 2,
+            binarize: true,
+            threshold: DEFAULT_THRESHOLD,
+            spellfix: true,
+            min_confidence: DEFAULT_MIN_CONFIDENCE,
+            retry_opposite_polarity: true,
+            debug: None,
+        }
+    }
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Ok(value) = std::env::var(LANGUAGES_VARIABLE) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                config.languages = trimmed.to_string();
+            }
+        }
+        if let Some(psm) = std::env::var(PSM_VARIABLE)
+            .ok()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|psm| *psm <= 13)
+        {
+            config.psm = Some(psm);
+        }
+        if let Some(scale) = std::env::var(SCALE_VARIABLE)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|scale| (1..=4).contains(scale))
+        {
+            config.scale = scale;
+        }
+        if let Some(binarize) = std::env::var(BINARIZE_VARIABLE)
+            .ok()
+            .and_then(|value| parse_switch(&value))
+        {
+            config.binarize = binarize;
+        }
+        if let Some(threshold) = std::env::var(THRESHOLD_VARIABLE)
+            .ok()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|threshold| (1..=254).contains(threshold))
+        {
+            config.threshold = threshold;
+        }
+        if let Some(spellfix) = std::env::var(SPELLFIX_VARIABLE)
+            .ok()
+            .and_then(|value| parse_switch(&value))
+        {
+            config.spellfix = spellfix;
+        }
+        if let Some(debug) = Debug::from_env() {
+            config.debug = Some(debug);
+        }
+        config
+    }
+
+    pub fn with_languages(mut self, languages: impl Into<String>) -> Self {
+        self.languages = languages.into();
+        self
+    }
+
+    pub fn with_psm(mut self, psm: u8) -> Self {
+        self.psm = Some(psm);
+        self
+    }
+
+    pub fn with_binarize(mut self, binarize: bool) -> Self {
+        self.binarize = binarize;
+        self
+    }
+
+    pub fn with_threshold(mut self, threshold: u8) -> Self {
+        self.threshold = threshold.clamp(1, 254);
+        self
+    }
+
+    pub fn with_spellfix(mut self, spellfix: bool) -> Self {
+        self.spellfix = spellfix;
+        self
+    }
+
+    pub fn with_retry_opposite_polarity(mut self, retry: bool) -> Self {
+        self.retry_opposite_polarity = retry;
+        self
+    }
+
+    pub fn with_debug(mut self, debug: Option<Debug>) -> Self {
+        self.debug = debug;
+        self
+    }
+}
+
+/// `1`/`0`, `true`/`false`, `on`/`off`, `yes`/`no` — anything else is ignored
+/// so a typo leaves the default in place rather than silently disabling the
+/// step that makes the crop readable.
+fn parse_switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub enum OcrError {
+    /// The binary is not installed.
+    NotInstalled { binary: PathBuf },
+    /// Tesseract ran but failed.
+    Failed { status: Option<i32>, stderr: String },
+    /// The process could not be started for another reason.
+    Spawn(String),
+    /// The capture could not be read or enlarged.
+    Image(String),
+}
+
+impl fmt::Display for OcrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OcrError::NotInstalled { binary } => write!(
+                f,
+                "OCR engine not configured: '{}' not found in PATH (install tesseract-ocr and the language packs)",
+                binary.display()
+            ),
+            OcrError::Failed { status, stderr } => {
+                let status = status
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                if stderr.is_empty() {
+                    write!(f, "OCR failed (exit {status})")
+                } else {
+                    write!(f, "OCR failed (exit {status}): {stderr}")
+                }
+            }
+            OcrError::Spawn(message) => write!(f, "could not run the OCR engine: {message}"),
+            OcrError::Image(message) => {
+                write!(f, "could not prepare the capture for OCR: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OcrError {}
+
+/// Run Tesseract over `image` and return the recognised lines, in reading order.
+///
+/// Kept as the simple entry point; [`recognize_reading`] also reports how many
+/// lines were found and dropped, which the status line needs.
+pub fn recognize(image: &Path, config: &Config) -> Result<Vec<TextBlock>, OcrError> {
+    recognize_reading(image, config).map(|reading| reading.blocks)
+}
+
+/// Read `image`, running the screenshot page segmentation mode and, only when
+/// that keeps too little, the sparse-text fallback.
+///
+/// One polarity is chosen for the whole crop. When that polarity hid a flat
+/// block — a selected passage in a dark page, or a dark block in a light page —
+/// the rows it cost are read again with the opposite polarity, one band per
+/// pass, and only the lines that land in that band are kept.
+pub fn recognize_reading(image: &Path, config: &Config) -> Result<Reading, OcrError> {
+    let prepared = Prepared::open(image, config)?;
+    let candidates: Vec<u8> = match config.psm {
+        Some(psm) => vec![psm],
+        None => vec![DEFAULT_PSM],
+    };
+    let mut attempts: Vec<Reading> = Vec::new();
+    let mut first_error = None;
+    for psm in candidates.iter().copied() {
+        // A missing language pack or a Tesseract without `osd` must not fail a
+        // capture that another mode can still read.
+        match run_pass(&prepared, config, psm, Variant::Paper) {
+            Ok(reading) => attempts.push(reading),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    let kept: usize = attempts.iter().map(Reading::kept).sum();
+    if config.psm.is_none() && kept < FALLBACK_BELOW_LINES {
+        for psm in FALLBACK_PSMS {
+            if let Ok(reading) = run_pass(&prepared, config, psm, Variant::Paper) {
+                attempts.push(reading);
+            }
+        }
+    }
+    if attempts.is_empty() {
+        return Err(first_error.unwrap_or(OcrError::Spawn("no reading produced".to_string())));
+    }
+
+    let mut chosen = choose(&attempts).unwrap_or_default();
+    let mut retries: Vec<Attempt> = Vec::new();
+    if config.binarize && config.retry_opposite_polarity {
+        for (index, band) in retry_bands(&prepared, &chosen).into_iter().enumerate() {
+            match run_pass(
+                &prepared,
+                config,
+                chosen.psm,
+                Variant::Opposite(index + 1, band),
+            ) {
+                Ok(reading) => {
+                    let attempt = Attempt::of(&reading);
+                    let added = recovered(&chosen.blocks, reading.blocks, band, prepared.scale);
+                    let kept_from_band = added.len();
+                    chosen.recovered += kept_from_band;
+                    chosen.found += reading.found;
+                    chosen.dropped_low_confidence += reading.dropped_low_confidence;
+                    chosen.dropped_unreadable += reading.dropped_unreadable;
+                    retries.push(attempt);
+                    chosen.corrections.extend(reading.corrections);
+                    chosen.elapsed_ms += reading.elapsed_ms;
+                    if kept_from_band > 0 {
+                        // Reading order, folded back into the one the primary
+                        // pass produced.
+                        chosen.blocks.extend(added);
+                        chosen
+                            .blocks
+                            .sort_by_key(|block| (block.bbox.y, block.bbox.x));
+                    }
+                }
+                Err(error) => {
+                    // A failed rescue must not fail the capture: the primary
+                    // reading is still a valid translation of the rest.
+                    eprintln!("cosmic-screenshot: opposite-polarity retry failed: {error}");
+                }
+            }
+        }
+    }
+    chosen.attempts = attempts.iter().map(Attempt::of).chain(retries).collect();
+    Ok(chosen)
+}
+
+/// Which bands to read again, if any. Empty when no band survived the caps, or
+/// when the primary pass read nothing: a crop with no recognised line is a
+/// whole-crop polarity problem, not a block inside a page, and inverting it
+/// wholesale is a different decision than this retry makes.
+fn retry_bands(prepared: &Prepared, reading: &Reading) -> Vec<Band> {
+    let Some(luma) = &prepared.luma else {
+        return Vec::new();
+    };
+    let mut bands = unread_bands(
+        luma,
+        prepared.paper,
+        prepared.threshold,
+        &reading.blocks,
+        prepared.scale,
+    );
+    if bands.is_empty() {
+        return Vec::new();
+    }
+    // The primary pass has to have read *something*. Note what this can and
+    // cannot prove: `unread_bands` only returns rows no recognised block
+    // covers, so "a line outside every band" is true by construction and
+    // decides nothing. What the retry actually relies on is the band test
+    // itself — a flat area of the opposite paper, capped at MAX_RETRY_BANDS —
+    // plus the credibility filter on what comes back, so a busy region is
+    // never *kept* from its inverted image even when a pass is spent on it.
+    if reading.blocks.is_empty() {
+        return Vec::new();
+    }
+    if bands.len() > MAX_RETRY_BANDS {
+        // One narrow band per strip is what a two-column page looks like, and
+        // that layout is a case this retry exists for: refusing every band on
+        // the count would skip it. Spend the passes on the tallest instead,
+        // then read them in page order.
+        bands.sort_by_key(|band| (std::cmp::Reverse(band.height()), band.top));
+        bands.truncate(MAX_RETRY_BANDS);
+        bands.sort_by_key(|band| band.top);
+    }
+    bands
+}
+
+impl Attempt {
+    fn of(reading: &Reading) -> Self {
+        Self {
+            psm: reading.psm,
+            found: reading.found,
+            kept: reading.kept(),
+            mean_confidence: reading.mean_confidence(),
+            elapsed_ms: reading.elapsed_ms,
+        }
+    }
+}
+
+/// Pick the reading with the most credible text: longer, more confident lines
+/// count for more than a pile of two-letter fragments.
+pub fn choose(readings: &[Reading]) -> Option<Reading> {
+    readings
+        .iter()
+        .max_by(|left, right| {
+            score(left)
+                .partial_cmp(&score(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.kept().cmp(&right.kept()))
+                .then_with(|| {
+                    left.mean_confidence()
+                        .partial_cmp(&right.mean_confidence())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .cloned()
+}
+
+fn score(reading: &Reading) -> f32 {
+    reading
+        .blocks
+        .iter()
+        .map(|block| {
+            let letters = block.text.chars().filter(|c| c.is_alphanumeric()).count() as f32;
+            // Letters count for more than linearly, so a dozen two-letter
+            // fragments do not outvote a real menu label.
+            (block.confidence.max(0.0) / 100.0) * letters.powf(1.5)
+        })
+        .sum()
+}
+
+/// The image Tesseract is actually pointed at, and how it maps back.
+struct Prepared {
+    path: PathBuf,
+    /// Kept alive for the duration of the passes; removing it would unlink the
+    /// file Tesseract is about to read.
+    _temps: Vec<tempfile::NamedTempFile>,
+    width: u32,
+    height: u32,
+    scale: u32,
+    /// The stretched greyscale the crop was binarised from, kept only when the
+    /// polarity retry can use it (binary mode on).
+    luma: Option<image::GrayImage>,
+    /// The whole crop was inverted before the split: its paper was dark.
+    inverted: bool,
+    /// Median luma after the stretch — the crop's own paper level.
+    paper: u8,
+    /// The split point the crop was binarised with, reused for band crops.
+    threshold: u8,
+}
+
+impl Prepared {
+    fn open(image: &Path, config: &Config) -> Result<Self, OcrError> {
+        let scale = config.scale.max(1);
+        let opened = image::open(image).map_err(|error| OcrError::Image(error.to_string()))?;
+        let (width, height) = (opened.width(), opened.height());
+        if scale == 1 && !config.binarize {
+            // Still decode once: it validates the capture before Tesseract is
+            // asked to, and gives the dump its dimensions.
+            return Ok(Self {
+                path: image.to_path_buf(),
+                _temps: Vec::new(),
+                width,
+                height,
+                scale,
+                luma: None,
+                inverted: false,
+                paper: 255,
+                threshold: config.threshold,
+            });
+        }
+
+        let prepared = if scale > 1 {
+            // Nearest neighbour, not Lanczos: a pixel font is already a grid of
+            // hard-edged blocks, and interpolation turns each stroke into a
+            // grey ramp that the threshold then erodes unevenly (`B`/`G`/`F`
+            // become each other). Exact doubling keeps every block exact.
+            opened.resize_exact(width * scale, height * scale, FilterType::Nearest)
+        } else {
+            opened
+        };
+
+        // Game UI is anti-aliased light text on a dark panel. Greyscale,
+        // stretch the histogram so a dim capture still uses the full range,
+        // then split hard: Tesseract reads the edges of soft glyphs as
+        // strokes and returns `AYancernrentS` for `Advancements`.
+        //
+        // The split calls everything at or above the threshold *paper*. On a
+        // dark panel that is the glyph, not the background, so the crop came
+        // out white-on-black and every line dimmer than the threshold
+        // (secondary text, a disabled label, a timestamp) was folded into the
+        // background and never reached Tesseract. Put the paper on the bright
+        // side first, so one threshold reads both themes.
+        //
+        // That decision is per *crop*, and a capture can hold both themes: a
+        // selected passage is a light block inside a dark page, and the crop's
+        // paper names the page, so the whole block is folded away. Keep the
+        // stretched greyscale so [`unread_bands`] can name the rows the split
+        // cost us and [`Prepared::band_crop`] can read them the other way up.
+        let (temp, path, luma, inverted, paper) = if config.binarize {
+            let mut luma = prepared.to_luma8();
+            autocontrast(&mut luma);
+            let paper = paper_luma(&luma);
+            let inverted = paper < 128;
+            let mut binarised = luma.clone();
+            binarise(&mut binarised, inverted, config.threshold);
+            let file = write_temp(image::DynamicImage::ImageLuma8(binarised))?;
+            let path = file.path().to_path_buf();
+            (file, path, Some(luma), inverted, paper)
+        } else {
+            let file = write_temp(prepared)?;
+            let path = file.path().to_path_buf();
+            (file, path, None, false, 255)
+        };
+
+        Ok(Self {
+            path,
+            _temps: vec![temp],
+            width,
+            height,
+            scale,
+            luma,
+            inverted,
+            paper,
+            threshold: config.threshold,
+        })
+    }
+
+    /// One band of the crop with the paper put on the *other* side of the
+    /// threshold, as a temporary file Tesseract can read — plus the prepared
+    /// row the crop actually starts at, margin included, so the caller can map
+    /// Tesseract's rows back to the capture.
+    fn band_crop(&self, band: Band) -> Result<(tempfile::NamedTempFile, u32), OcrError> {
+        let Some(luma) = &self.luma else {
+            return Err(OcrError::Image(
+                "no greyscale crop for a polarity retry".to_string(),
+            ));
+        };
+        let top = band.top.saturating_sub(BAND_MARGIN);
+        let bottom = (band.bottom + BAND_MARGIN).min(luma.height());
+        let height = bottom.saturating_sub(top).max(1);
+        let mut crop = image::imageops::crop_imm(luma, 0, top, luma.width(), height).to_image();
+        // The primary image inverted when the crop's paper was dark; the retry
+        // is the opposite choice, so invert exactly when the primary did not.
+        binarise(&mut crop, !self.inverted, self.threshold);
+        Ok((write_temp(image::DynamicImage::ImageLuma8(crop))?, top))
+    }
+}
+
+fn write_temp(image: image::DynamicImage) -> Result<tempfile::NamedTempFile, OcrError> {
+    let mut temp = tempfile::Builder::new()
+        .prefix("cosmic-screenshot-ocr-")
+        .suffix(".png")
+        .tempfile()
+        .map_err(|error| OcrError::Image(error.to_string()))?;
+    image
+        .write_to(temp.as_file_mut(), image::ImageFormat::Png)
+        .map_err(|error| OcrError::Image(error.to_string()))?;
+    Ok(temp)
+}
+
+/// Stretch the luma histogram to the full 0–255 range, so the threshold sees a
+/// dim capture with the same contrast as a bright one.
+fn autocontrast(image: &mut image::GrayImage) {
+    let mut histogram = [0u32; 256];
+    for pixel in image.pixels() {
+        histogram[pixel.0[0] as usize] += 1;
+    }
+    let (Some(low), Some(high)) = (
+        histogram.iter().position(|count| *count > 0),
+        histogram.iter().rposition(|count| *count > 0),
+    ) else {
+        return;
+    };
+    if high <= low {
+        return;
+    }
+    let span = (high - low) as f32;
+    let mut lut = [0u8; 256];
+    for (value, mapped) in lut.iter_mut().enumerate() {
+        *mapped = ((value.saturating_sub(low) as f32 / span) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    for pixel in image.pixels_mut() {
+        pixel.0[0] = lut[pixel.0[0] as usize];
+    }
+}
+
+/// Hard split: at or above the threshold is paper, below it is ink.
+fn split_at(image: &mut image::GrayImage, threshold: u8) {
+    for pixel in image.pixels_mut() {
+        pixel.0[0] = if pixel.0[0] >= threshold { 255 } else { 0 };
+    }
+}
+
+/// Median luma of this stretched crop. A screenshot is mostly background, so
+/// the median names its paper; an empty image reports white so it is not
+/// flipped.
+fn paper_luma(image: &image::GrayImage) -> u8 {
+    let mut histogram = [0u32; 256];
+    for pixel in image.pixels() {
+        histogram[pixel.0[0] as usize] += 1;
+    }
+    let total: u32 = histogram.iter().sum();
+    if total == 0 {
+        return 255;
+    }
+    let mut seen = 0u32;
+    for (value, count) in histogram.iter().enumerate() {
+        seen += count;
+        if seen * 2 >= total {
+            return value as u8;
+        }
+    }
+    255
+}
+
+/// Put the paper on the bright side (when `inverted`), then split hard.
+fn binarise(image: &mut image::GrayImage, inverted: bool, threshold: u8) {
+    if inverted {
+        invert(image);
+    }
+    split_at(image, threshold);
+}
+
+/// Swap ink and paper, so the dark side is ink whatever the theme.
+fn invert(image: &mut image::GrayImage) {
+    for pixel in image.pixels_mut() {
+        pixel.0[0] = 255 - pixel.0[0];
+    }
+}
+
+/// Which image a pass reads: the whole crop at the polarity its own paper
+/// names, or one band of it at the opposite polarity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    Paper,
+    /// The band index (1-based, for the debug dump) and the rows to read.
+    Opposite(usize, Band),
+}
+
+fn run_pass(
+    prepared: &Prepared,
+    config: &Config,
+    psm: u8,
+    variant: Variant,
+) -> Result<Reading, OcrError> {
+    let started = Instant::now();
+    // A band crop is its own temporary file, and dropping it would unlink the
+    // file Tesseract is about to read: it lives until this pass returns.
+    let _band_file;
+    let (path, offset, stem) = match variant {
+        Variant::Paper => (prepared.path.clone(), 0, format!("psm{psm}")),
+        Variant::Opposite(index, band) => {
+            let (file, top) = prepared.band_crop(band)?;
+            let path = file.path().to_path_buf();
+            _band_file = file;
+            (path, top, format!("psm{psm}-opposite-{index}"))
+        }
+    };
+    let output = Command::new(&config.binary)
+        .arg(&path)
+        .arg("stdout")
+        .arg("-l")
+        .arg(&config.languages)
+        .arg("--psm")
+        .arg(psm.to_string())
+        .arg("tsv")
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                OcrError::NotInstalled {
+                    binary: config.binary.clone(),
+                }
+            } else {
+                OcrError::Spawn(error.to_string())
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(OcrError::Failed {
+            status: output.status.code(),
+            stderr: last_line(&stderr),
+        });
+    }
+
+    let tsv = String::from_utf8_lossy(&output.stdout);
+    let (parsed, corrections) = parse_tsv_with(&tsv, config.spellfix);
+    let found = parsed.len();
+    let mut blocks = Vec::with_capacity(found);
+    let mut low_confidence = 0;
+    let mut unreadable = 0;
+    for mut block in parsed {
+        // A band crop starts at the row `band_crop` reports — the band minus
+        // its margin — so Tesseract's rows have to move down by exactly that
+        // before they are mapped back to capture pixels.
+        block.bbox.y = block.bbox.y.saturating_add(offset);
+        block.bbox = block.bbox.scaled(prepared.scale);
+        if block.confidence < config.min_confidence {
+            low_confidence += 1;
+        } else if !is_readable(&block.text) {
+            unreadable += 1;
+        } else {
+            blocks.push(block);
+        }
+    }
+
+    let reading = Reading {
+        blocks,
+        found,
+        dropped_low_confidence: low_confidence,
+        dropped_unreadable: unreadable,
+        psm,
+        languages: config.languages.clone(),
+        scale: prepared.scale,
+        elapsed_ms: started.elapsed().as_millis(),
+        attempts: Vec::new(),
+        corrections,
+        recovered: 0,
+    };
+
+    if let Some(debug) = &config.debug {
+        // Diagnostics must never fail a capture the user asked for: a full
+        // disk loses the dump, not the translation.
+        let note = |result: Result<(), std::io::Error>| {
+            if let Err(error) = result {
+                eprintln!("cosmic-screenshot: could not write the OCR debug dump: {error}");
+            }
+        };
+        note(std::fs::copy(&path, debug.path(&format!("{stem}-crop.png"))).map(|_| ()));
+        note(std::fs::write(
+            debug.path(&format!("{stem}.tsv")),
+            tsv.as_bytes(),
+        ));
+        let summary = format!(
+            "languages: {}\npsm: {psm}\nscale: {}\npreprocess: {}\nvariant: {}\ninput: {}x{} (enlarged {}x{})\nfound: {}\nkept: {}\ndropped (confidence < {}): {}\ndropped (unreadable): {}\ncorrected: {}\nelapsed: {} ms\n",
+            config.languages,
+            prepared.scale,
+            if config.binarize {
+                format!("binarised at {}", prepared.threshold)
+            } else {
+                "greyscale, no binarisation".to_string()
+            },
+            match variant {
+                Variant::Paper => "crop's own polarity".to_string(),
+                Variant::Opposite(_, band) => format!(
+                    "opposite polarity, rows {}..{} of the prepared crop",
+                    band.top, band.bottom
+                ),
+            },
+            prepared.width,
+            prepared.height,
+            prepared.width * prepared.scale,
+            prepared.height * prepared.scale,
+            reading.found,
+            reading.kept(),
+            config.min_confidence,
+            reading.dropped_low_confidence,
+            reading.dropped_unreadable,
+            reading.corrections.len(),
+            started.elapsed().as_millis(),
+        );
+        note(std::fs::write(debug.path(&format!("{stem}.txt")), summary));
+    }
+
+    Ok(reading)
+}
+
+/// A run of rows whose paper is on the opposite side of the crop's own paper:
+/// a flat block the global polarity folded into the background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Band {
+    /// Prepared-image rows, `bottom` exclusive.
+    top: u32,
+    bottom: u32,
+}
+
+impl Band {
+    fn height(self) -> u32 {
+        self.bottom.saturating_sub(self.top)
+    }
+}
+
+/// The rows no recognised block covers and that hold a flat area of the other
+/// polarity. This is what tells a selected passage apart from the page: the
+/// page's paper names the crop, the passage's paper is the other colour, and
+/// Tesseract never saw its lines because they came out as one solid bar.
+fn unread_bands(
+    luma: &image::GrayImage,
+    paper: u8,
+    threshold: u8,
+    blocks: &[TextBlock],
+    scale: u32,
+) -> Vec<Band> {
+    let (width, height) = luma.dimensions();
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let delta = 255u8.saturating_sub(threshold);
+    let paper_is_dark = paper < 128;
+    let needed = ((width as f32 * BAND_MIN_SHARE) as u32).max(8);
+    let needed_run = ((width as f32 * BAND_MIN_RUN_SHARE) as u32).max(12);
+
+    let mut covered = vec![false; height as usize];
+    let step = scale.max(1);
+    for block in blocks {
+        let top = block.bbox.y.saturating_mul(step).min(height);
+        let bottom = block.bbox.bottom().saturating_mul(step).min(height);
+        for row in &mut covered[top as usize..bottom as usize] {
+            *row = true;
+        }
+    }
+
+    let mut bands: Vec<Band> = Vec::new();
+    // The band being built, its anchor colour, and how many of its rows have
+    // been one unbroken run of the other *paper* rather than a line of the
+    // other ink.
+    let mut current: Option<(Band, f32, u32)> = None;
+    for row in 0..height {
+        let opposite = if covered[row as usize] {
+            None
+        } else {
+            opposite_row(luma, row, paper, delta, paper_is_dark, needed)
+        };
+        match opposite {
+            Some((median, longest)) => {
+                let paper_row = u32::from(longest >= needed_run);
+                match current {
+                    Some((mut band, anchor, paper_rows))
+                        if (median - anchor).abs() <= BAND_FLATNESS =>
+                    {
+                        band.bottom = row + 1;
+                        current = Some((band, anchor, paper_rows + paper_row));
+                    }
+                    Some((band, _, paper_rows)) => {
+                        push_band(&mut bands, band, scale, paper_rows);
+                        current = Some((
+                            Band {
+                                top: row,
+                                bottom: row + 1,
+                            },
+                            median,
+                            paper_row,
+                        ));
+                    }
+                    None => {
+                        current = Some((
+                            Band {
+                                top: row,
+                                bottom: row + 1,
+                            },
+                            median,
+                            paper_row,
+                        ));
+                    }
+                }
+            }
+            None => {
+                if let Some((band, _, paper_rows)) = current.take() {
+                    push_band(&mut bands, band, scale, paper_rows);
+                }
+            }
+        }
+    }
+    if let Some((band, _, paper_rows)) = current {
+        push_band(&mut bands, band, scale, paper_rows);
+    }
+    bands
+}
+
+/// The dominant luma of this row's opposite-polarity pixels — and the longest
+/// unbroken run of them — when enough of the row is on the other side of the
+/// paper to be worth taking.
+///
+/// Modal, not median: a row that crosses a line of glyphs also holds the
+/// glyphs' antialiasing, and a median there drops towards the ink and splits
+/// one flat passage into a band per line. The passage's paper is still the most
+/// common colour in its own row. The run is what tells the passage's own paper
+/// from the page's own ink: see [`BAND_MIN_RUN_SHARE`].
+fn opposite_row(
+    luma: &image::GrayImage,
+    row: u32,
+    paper: u8,
+    delta: u8,
+    paper_is_dark: bool,
+    needed: u32,
+) -> Option<(f32, u32)> {
+    // 32 buckets of (count, sum) over the luma range.
+    let mut buckets = [[0u32; 2]; 32];
+    let mut count = 0u32;
+    let mut run = 0u32;
+    let mut longest = 0u32;
+    for x in 0..luma.width() {
+        let value = luma.get_pixel(x, row)[0];
+        let opposite = if paper_is_dark {
+            value >= paper.saturating_add(delta)
+        } else {
+            value <= paper.saturating_sub(delta)
+        };
+        if opposite {
+            let bucket = &mut buckets[(value >> 3) as usize];
+            bucket[0] += 1;
+            bucket[1] += value as u32;
+            count += 1;
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if count < needed {
+        return None;
+    }
+    let winner = buckets
+        .iter()
+        .max_by_key(|bucket| bucket[0])
+        .copied()
+        .unwrap_or([0, 0]);
+    let total = winner[0].max(1);
+    Some((winner[1] as f32 / total as f32, longest))
+}
+
+fn push_band(bands: &mut Vec<Band>, band: Band, scale: u32, paper_rows: u32) {
+    if paper_rows * 4 < band.height() {
+        // Fewer than a quarter of these rows are one run of the other paper:
+        // a line of the other ink — even one with a rule or an underline in it,
+        // which is one long run — and not a passage. Reading it upside down is
+        // how a misreading gets repainted.
+        return;
+    }
+    // `band` is in prepared rows, `MIN_BAND_ROWS` in capture pixels.
+    if band.height() >= MIN_BAND_ROWS.saturating_mul(scale.max(1)) {
+        bands.push(band);
+    }
+}
+
+/// Keep only the lines a retry actually recovered: they must sit in the band
+/// that was read, and must not duplicate a line the primary pass already had.
+fn recovered(
+    existing: &[TextBlock],
+    candidates: Vec<TextBlock>,
+    band: Band,
+    scale: u32,
+) -> Vec<TextBlock> {
+    let step = scale.max(1);
+    candidates
+        .into_iter()
+        .filter(|block| {
+            let centre = (block.bbox.y + block.bbox.height / 2).saturating_mul(step);
+            centre >= band.top
+                && centre < band.bottom
+                && !existing
+                    .iter()
+                    .any(|known| intersects(known.bbox, block.bbox))
+        })
+        .collect()
+}
+
+fn intersects(left: Bbox, right: Bbox) -> bool {
+    left.x < right.right()
+        && right.x < left.right()
+        && left.y < right.bottom()
+        && right.y < left.bottom()
+}
+
+fn last_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(300)
+        .collect()
+}
+
+/// Is this block worth translating? Real UI text has at least three letters
+/// (or is a well-known two-letter label such as `OK`); a textured button can
+/// make Tesseract emit `|||` or `}{`, and an icon can yield `Ei`, which must
+/// not become "text".
+fn is_readable(text: &str) -> bool {
+    let mut letters = 0usize;
+    let mut other = 0usize;
+    for character in text.chars() {
+        if character.is_alphanumeric() {
+            letters += 1;
+        } else if !character.is_whitespace() {
+            other += 1;
+        }
+    }
+    let enough = letters >= 3 || is_short_ui_label(text);
+    enough && other * 2 <= letters + other
+}
+
+/// Two-letter UI words that are real labels, not fragments, across the
+/// languages the tool translates. An icon read as `Ei` is not on this list.
+const SHORT_LABELS: [&str; 13] = [
+    "ok", "no", "on", "up", "go", "ja", "sí", "si", "da", "ya", "да", "не", "ні",
+];
+
+fn is_short_ui_label(text: &str) -> bool {
+    let trimmed = text.trim_matches(|character: char| !character.is_alphanumeric());
+    let lower = trimmed.to_lowercase();
+    if SHORT_LABELS.contains(&lower.as_str()) {
+        return true;
+    }
+    // Kana, Han and Hangul are written without spaces, so a two-character block
+    // is a word (`はい`), not the kind of two-letter fragment `Ei` is.
+    let characters: Vec<char> = trimmed.chars().collect();
+    characters.len() == 2 && characters.iter().all(|character| is_cjk(*character))
+}
+
+/// One word Tesseract returned, kept with its own box so paint areas can be
+/// built from words rather than from the line.
+#[derive(Clone, Debug)]
+struct Word {
+    bbox: Bbox,
+    /// Tesseract's word index within the line: reading order, which is not the
+    /// same as left-to-right for a right-to-left script.
+    number: u32,
+    text: String,
+    confidence: f32,
+}
+
+/// Parse Tesseract's TSV output (one row per word) into paint-sized blocks.
+///
+/// A block is a cluster of words, not a Tesseract line: the line box starts at
+/// a button border when the border was read as a glyph, and psm 6 merges two
+/// button columns into a single line. See [`parse_tsv_with`].
+pub fn parse_tsv(tsv: &str) -> Vec<TextBlock> {
+    parse_tsv_with(tsv, false).0
+}
+
+/// Parse the TSV, optionally repairing OCR typos, and report the repairs.
+///
+/// Level-5 rows are grouped by Tesseract's line key, then:
+///
+/// 1. tokens with no letters (`|`, `}`, `..`) are dropped — the first token on
+///    a button line is often its border, which must not anchor the paint box;
+/// 2. the remaining words are clustered by horizontal gap, so one line that
+///    spans `Give Feedback` and `Report Bugs` becomes two blocks;
+/// 3. each cluster's box is the union of its words, and its text is those
+///    words in reading order.
+pub fn parse_tsv_with(tsv: &str, spellfix: bool) -> (Vec<TextBlock>, Vec<Correction>) {
+    type LineKey = (u32, u32, u32, u32);
+    let mut lines: Vec<(LineKey, Vec<Word>)> = Vec::new();
+    let mut index: HashMap<LineKey, usize> = HashMap::new();
+
+    for row in tsv.lines() {
+        let columns: Vec<&str> = row.split('\t').collect();
+        if columns.len() < 12 {
+            continue;
+        }
+        let level = match columns[0].parse::<u32>() {
+            Ok(level) => level,
+            Err(_) => continue, // header row
+        };
+        if level != 5 {
+            continue;
+        }
+        let confidence = columns[10].parse::<f32>().unwrap_or(-1.0);
+        let text = columns[11].trim();
+        if text.is_empty() || confidence < 0.0 {
+            continue;
+        }
+        let Ok(x) = columns[6].parse::<u32>() else {
+            continue;
+        };
+        let Ok(y) = columns[7].parse::<u32>() else {
+            continue;
+        };
+        let Ok(width) = columns[8].parse::<u32>() else {
+            continue;
+        };
+        let Ok(height) = columns[9].parse::<u32>() else {
+            continue;
+        };
+        let Ok(page) = columns[1].parse::<u32>() else {
+            continue;
+        };
+        let Ok(block) = columns[2].parse::<u32>() else {
+            continue;
+        };
+        let Ok(paragraph) = columns[3].parse::<u32>() else {
+            continue;
+        };
+        let Ok(line) = columns[4].parse::<u32>() else {
+            continue;
+        };
+        let Ok(word) = columns[5].parse::<u32>() else {
+            continue;
+        };
+
+        let key = (page, block, paragraph, line);
+        let position = *index.entry(key).or_insert_with(|| {
+            lines.push((key, Vec::new()));
+            lines.len() - 1
+        });
+        lines[position].1.push(Word {
+            bbox: Bbox {
+                x,
+                y,
+                width,
+                height,
+            },
+            number: word,
+            text: text.to_string(),
+            confidence,
+        });
+    }
+
+    let mut lines: Vec<Vec<Word>> = lines
+        .into_iter()
+        .map(|(_, mut words)| {
+            // A token without a letter is decoration, not a label.
+            words.retain(|word| word.text.chars().any(char::is_alphabetic));
+            words
+        })
+        .filter(|words| !words.is_empty())
+        .collect();
+
+    // Two-word lines (one label per column) have no usable local median gap, so
+    // they borrow the page's idea of a word gap.
+    let global_gap = median_gap(lines.iter().map(Vec::as_slice));
+
+    let mut blocks = Vec::new();
+    let mut corrections = Vec::new();
+    for words in &mut lines {
+        words.sort_by_key(|word| (word.number, word.bbox.x));
+        let tokens: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+        if spellfix {
+            let (repaired, fired) = spellfix::correct_line(&tokens);
+            corrections.extend(fired);
+            for (word, text) in words.iter_mut().zip(repaired) {
+                word.text = text;
+            }
+        }
+
+        words.sort_by_key(|word| (word.bbox.x, word.number));
+        for cluster in cluster_line(words, global_gap) {
+            let mut bbox: Option<Bbox> = None;
+            let mut confidence = 0.0;
+            let mut texts = Vec::with_capacity(cluster.len());
+            for word in &cluster {
+                match &mut bbox {
+                    Some(existing) => existing.union(word.bbox),
+                    None => bbox = Some(word.bbox),
+                }
+                confidence += word.confidence;
+                texts.push(word.text.as_str());
+            }
+            let Some(bbox) = bbox else { continue };
+            blocks.push(TextBlock {
+                bbox,
+                text: join_words(&texts),
+                confidence: confidence / cluster.len().max(1) as f32,
+            });
+        }
+    }
+
+    // Reading order: top to bottom, then left to right.
+    blocks.sort_by_key(|block| (block.bbox.y, block.bbox.x));
+    (blocks, corrections)
+}
+
+/// Split a left-to-right-sorted line into label clusters.
+///
+/// A gap wider than twice the line's median word gap starts a new block; a gap
+/// wider than 1.2 line heights always does, so two words on opposite sides of a
+/// wide button are never painted as one. When a line has fewer than two gaps
+/// (one or two words) there is no local median, so the page median is used,
+/// capped at half the line height: on a page of two-column rows the page median
+/// is the column gap itself, and 2× it would otherwise outvote the height floor.
+fn cluster_line(words: &[Word], global_gap: Option<u32>) -> Vec<Vec<&Word>> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let gaps: Vec<u32> = words
+        .windows(2)
+        .map(|pair| pair[1].bbox.x.saturating_sub(pair[0].bbox.right()))
+        .collect();
+    let height = median_value(words.iter().map(|word| word.bbox.height)).unwrap_or(1);
+    let basis = if gaps.len() >= 2 {
+        // The line's own word spacing: 2× this is the split point, so a label
+        // whose words are widely spaced stays one block (its median is wide
+        // too). The lower median keeps one column gap from setting the pace.
+        median_value(gaps.iter().copied())
+    } else {
+        // A page whose rows are mostly two columns has a page median that *is*
+        // the column gap. Cap only this borrowed median at half the line
+        // height, so 2×basis cannot outvote the 1.2×height floor.
+        global_gap.map(|gap| gap.min(height / 2))
+    }
+    .unwrap_or(height / 2)
+    .max(1);
+    let split = ((basis as f32 * 2.0).max(height as f32 * 1.2)).round() as u32;
+
+    let mut clusters: Vec<Vec<&Word>> = Vec::new();
+    let mut current = vec![&words[0]];
+    for (position, pair) in words.windows(2).enumerate() {
+        if gaps[position] > split {
+            clusters.push(std::mem::take(&mut current));
+        }
+        current.push(&pair[1]);
+    }
+    clusters.push(current);
+    for cluster in &mut clusters {
+        cluster.sort_by_key(|word| word.number);
+    }
+    clusters
+}
+
+fn median_gap<'a>(lines: impl Iterator<Item = &'a [Word]>) -> Option<u32> {
+    let mut gaps = Vec::new();
+    for words in lines {
+        let mut ordered: Vec<&Word> = words.iter().collect();
+        ordered.sort_by_key(|word| (word.bbox.x, word.number));
+        gaps.extend(
+            ordered
+                .windows(2)
+                .map(|pair| pair[1].bbox.x.saturating_sub(pair[0].bbox.right())),
+        );
+    }
+    median_value(gaps.into_iter())
+}
+
+fn median_value(values: impl Iterator<Item = u32>) -> Option<u32> {
+    let mut values: Vec<u32> = values.collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    // Lower median: with two gaps, one of which is the gap between columns, the
+    // smaller one is the word gap we want to measure against.
+    Some(values[(values.len() - 1) / 2])
+}
+
+/// Join OCR words into a line. CJK scripts have no inter-word spaces, so a
+/// space is only inserted when either side of the boundary is non-CJK.
+fn join_words(words: &[&str]) -> String {
+    let mut joined = String::new();
+    for (position, word) in words.iter().enumerate() {
+        if position > 0 {
+            let previous = joined.chars().next_back();
+            let next = word.chars().next();
+            if !(previous.is_some_and(is_cjk) && next.is_some_and(is_cjk)) {
+                joined.push(' ');
+            }
+        }
+        joined.push_str(word);
+    }
+    joined
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(character as u32,
+        0x3040..=0x30FF     // kana
+        | 0x3400..=0x4DBF   // CJK extension A
+        | 0x4E00..=0x9FFF   // CJK unified ideographs
+        | 0xF900..=0xFAFF   // compatibility ideographs
+        | 0xFF65..=0xFF9F   // half-width kana
+        | 0xAC00..=0xD7AF   // hangul syllables
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str, confidence: f32) -> TextBlock {
+        TextBlock {
+            bbox: Bbox {
+                x: 10,
+                y: 10,
+                width: 80,
+                height: 20,
+            },
+            text: text.to_string(),
+            confidence,
+        }
+    }
+
+    fn reading(psm: u8, lines: Vec<TextBlock>) -> Reading {
+        Reading {
+            found: lines.len(),
+            blocks: lines,
+            psm,
+            languages: "eng".to_string(),
+            scale: 2,
+            ..Reading::default()
+        }
+    }
+
+    #[test]
+    fn parses_words_into_lines() {
+        let blocks = parse_tsv(include_str!("../tests/fixtures/sample.tsv"));
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].text, "Guten Tag");
+        assert_eq!(
+            blocks[0].bbox,
+            Bbox {
+                x: 100,
+                y: 50,
+                width: 180,
+                height: 24
+            }
+        );
+        assert!((blocks[0].confidence - 92.5).abs() < 0.01);
+        assert_eq!(blocks[1].text, "Wie geht es dir?");
+        assert_eq!(blocks[1].bbox.y, 90);
+    }
+
+    #[test]
+    fn paint_boxes_come_from_words_not_the_line() {
+        let blocks = parse_tsv(include_str!("../tests/fixtures/menu-psm6.tsv"));
+        let texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Bane Menu",
+                "Back to Game",
+                "Give Feedback",
+                "Report Bugs",
+                "Advancements",
+                "Statistics",
+                "Options...",
+                "Achievements",
+                "Mods",
+                "Disconnect",
+            ]
+        );
+        assert!(
+            blocks.iter().all(|block| !block.text.contains('|')),
+            "a border glyph must never become text: {texts:?}"
+        );
+
+        // The dump's line box was x=342 w=1595, anchored on the button border.
+        // The words start at 1167 and end at 1937.
+        let back = &blocks[1];
+        assert_eq!(back.bbox.x, 1167, "paint box must start at the first word");
+        assert_eq!(
+            back.bbox.width, 770,
+            "and not include the border or the gap"
+        );
+
+        let on_row = |y: u32| blocks.iter().filter(|block| block.bbox.y == y).count();
+        assert_eq!(
+            on_row(930),
+            2,
+            "Give Feedback and Report Bugs are two buttons"
+        );
+        assert_eq!(
+            on_row(1214),
+            2,
+            "Advancements and Statistics are two columns"
+        );
+        assert_eq!(on_row(1502), 2, "Options and Achievements are two columns");
+    }
+
+    #[test]
+    fn a_page_of_two_column_rows_still_splits_them() {
+        // Every row is two columns, so the page median gap is the column gap.
+        // Without the height cap, 2 × 300 beats 1.2 × 198 and both rows merge.
+        let row = |line: u32, y: u32| {
+            format!(
+                "5\t1\t1\t1\t{line}\t1\t400\t{y}\t800\t198\t79\tAdvancements\n\
+                 5\t1\t1\t1\t{line}\t2\t1500\t{y}\t1049\t198\t77\tStatistics\n"
+            )
+        };
+        let tsv = format!(
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n{}{}",
+            row(1, 1214),
+            row(2, 1502)
+        );
+        let blocks = parse_tsv(&tsv);
+        assert_eq!(blocks.len(), 4, "{blocks:#?}");
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Advancements", "Statistics", "Advancements", "Statistics"]
+        );
+    }
+
+    #[test]
+    fn widely_spaced_words_of_one_label_stay_one_block() {
+        // A pixel font can put 240 px between words on a 198 px line; the line's
+        // own median gap is that wide, so 2×median keeps `Back to Game` whole.
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   5\t1\t1\t1\t1\t1\t0\t0\t100\t198\t85\tBack\n\
+                   5\t1\t1\t1\t1\t2\t340\t0\t90\t198\t91\tto\n\
+                   5\t1\t1\t1\t1\t3\t670\t0\t120\t198\t87\tGame\n";
+        let blocks = parse_tsv(tsv);
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].text, "Back to Game");
+    }
+
+    #[test]
+    fn three_words_on_one_line_still_split_at_a_column_gap() {
+        // Two words of one label and one word of the next column: with only two
+        // gaps, the upper median would be the column gap itself and nothing
+        // would split. The lower median keeps the word gap as the measure.
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   5\t1\t1\t1\t1\t1\t0\t0\t100\t100\t90\tGive\n\
+                   5\t1\t1\t1\t1\t2\t150\t0\t300\t100\t90\tFeedback\n\
+                   5\t1\t1\t1\t1\t3\t800\t0\t250\t100\t90\tReport\n";
+        let blocks = parse_tsv(tsv);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].text, "Give Feedback");
+        assert_eq!(blocks[1].text, "Report");
+    }
+
+    #[test]
+    fn the_corrector_repairs_menu_tokens_and_is_reported() {
+        let tsv = include_str!("../tests/fixtures/menu-psm6.tsv");
+        let (blocks, corrections) = parse_tsv_with(tsv, true);
+        assert_eq!(blocks[0].text, "Game Menu");
+        assert_eq!(
+            corrections,
+            vec![Correction {
+                from: "Bane".to_string(),
+                to: "Game".to_string(),
+                distance: 2,
+            }],
+            "only the ambiguous title token needs the phrase to settle it"
+        );
+
+        let (plain, none) = parse_tsv_with(tsv, false);
+        assert_eq!(plain[0].text, "Bane Menu");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn two_letter_fragments_are_not_text_but_real_short_labels_are() {
+        assert!(!is_readable("Ei"), "a mod icon is not a menu label");
+        assert!(!is_readable("|"));
+        assert!(is_readable("OK"));
+        assert!(is_readable("No"));
+        assert!(is_readable("Back to Game"));
+        // Short labels in the other supported languages are words, not junk.
+        for label in ["Ja", "Sí", "Da", "Ya", "Да", "Не", "Ні", "はい", "是的"] {
+            assert!(is_readable(label), "{label} is a real label");
+        }
+    }
+
+    #[test]
+    fn the_corrector_can_be_switched_off_from_the_environment() {
+        unsafe { std::env::set_var(SPELLFIX_VARIABLE, "off") };
+        assert!(!Config::from_env().spellfix);
+        unsafe {
+            std::env::set_var(SPELLFIX_VARIABLE, "on");
+            assert!(Config::from_env().spellfix);
+            std::env::remove_var(SPELLFIX_VARIABLE);
+        }
+        assert!(Config::from_env().spellfix, "on by default");
+    }
+
+    #[test]
+    fn ignores_header_low_confidence_and_empty_words() {
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t-1\t\n\
+                   5\t1\t1\t1\t1\t2\t0\t0\t10\t10\t95\t \n\
+                   5\t1\t1\t1\t1\t3\t0\t0\t10\t10\t95\tHi\n";
+        let blocks = parse_tsv(tsv);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Hi");
+        assert!((blocks[0].confidence - 95.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn joins_cjk_without_spaces() {
+        assert_eq!(join_words(&["日本", "語"]), "日本語");
+        assert_eq!(join_words(&["Hello", "世界"]), "Hello 世界");
+        assert_eq!(join_words(&["Hello", "world"]), "Hello world");
+    }
+
+    #[test]
+    fn symbol_soup_is_not_readable_text() {
+        assert!(is_readable("Back to Game"));
+        assert!(is_readable("OK"));
+        assert!(is_readable("Spielemenü"));
+        assert!(is_readable("日本語"));
+        assert!(is_readable("Options..."));
+        assert!(!is_readable("|||"));
+        assert!(!is_readable("}{"));
+        assert!(!is_readable(".."));
+        assert!(!is_readable("o"));
+        assert!(
+            !is_readable("I}.1.I}..I}"),
+            "a textured button must not become a translated line"
+        );
+    }
+
+    #[test]
+    fn the_reading_with_more_credible_text_wins() {
+        let sparse_one_line = reading(11, vec![line("Game Menu", 96.0)]);
+        let block_nine = reading(
+            6,
+            vec![
+                line("Back to Game", 84.0),
+                line("Advancements", 82.0),
+                line("Statistics", 80.0),
+                line("Give Feedback", 78.0),
+                line("Options...", 86.0),
+                line("Mods", 74.0),
+                line("Disconnect", 83.0),
+            ],
+        );
+        let chosen = choose(&[sparse_one_line, block_nine]).expect("a reading");
+        assert_eq!(chosen.psm, 6, "the pass that found the menu labels wins");
+    }
+
+    #[test]
+    fn fragments_do_not_beat_real_lines() {
+        let mut fragments = Vec::new();
+        for _ in 0..12 {
+            fragments.push(line("oh", 60.0));
+        }
+        let real = reading(11, vec![line("Back to Game", 80.0), line("Options", 78.0)]);
+        let chosen = choose(&[reading(6, fragments), real]).expect("a reading");
+        assert_eq!(chosen.kept(), 2);
+    }
+
+    #[test]
+    fn no_candidates_is_an_empty_reading() {
+        assert!(choose(&[]).is_none());
+    }
+
+    #[test]
+    fn boxes_map_back_from_the_enlarged_image() {
+        let boxed = Bbox {
+            x: 21,
+            y: 41,
+            width: 201,
+            height: 39,
+        };
+        assert_eq!(
+            boxed.scaled(2),
+            Bbox {
+                x: 11,
+                y: 21,
+                width: 101,
+                height: 20
+            }
+        );
+        assert_eq!(boxed.scaled(1), boxed);
+    }
+
+    #[test]
+    fn missing_binary_is_a_clear_one_liner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let image = dir.path().join("tiny.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]))
+            .save(&image)
+            .expect("write test image");
+        let config = Config {
+            binary: PathBuf::from("tesseract-does-not-exist"),
+            ..Config::default()
+        };
+        let error = recognize(&image, &config).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.starts_with("OCR engine not configured:"),
+            "{message}"
+        );
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn reads_languages_from_the_environment() {
+        unsafe { std::env::set_var(LANGUAGES_VARIABLE, "eng+deu") };
+        assert_eq!(Config::from_env().languages, "eng+deu");
+        unsafe { std::env::remove_var(LANGUAGES_VARIABLE) };
+        assert_eq!(Config::from_env().languages, ALL_LANGUAGES);
+    }
+
+    #[test]
+    fn scale_and_psm_can_be_pinned_for_tuning() {
+        unsafe {
+            std::env::set_var(SCALE_VARIABLE, "3");
+            std::env::set_var(PSM_VARIABLE, "6");
+        }
+        let config = Config::from_env();
+        assert_eq!(config.scale, 3);
+        assert_eq!(config.psm, Some(6));
+        unsafe {
+            std::env::set_var(SCALE_VARIABLE, "99");
+            std::env::set_var(PSM_VARIABLE, "99");
+            std::env::remove_var(PSM_VARIABLE);
+            std::env::remove_var(SCALE_VARIABLE);
+        }
+        let config = Config::from_env();
+        assert_eq!(config.scale, 2, "out of range values keep the default");
+        assert_eq!(config.psm, None);
+    }
+
+    #[test]
+    fn autocontrast_stretches_the_histogram_before_the_split() {
+        let mut image = image::GrayImage::from_raw(4, 1, vec![100, 120, 140, 160]).expect("image");
+        autocontrast(&mut image);
+        let stretched: Vec<u8> = image.pixels().map(|pixel| pixel.0[0]).collect();
+        assert_eq!(stretched, vec![0, 85, 170, 255]);
+
+        split_at(&mut image, DEFAULT_THRESHOLD);
+        let split: Vec<u8> = image.pixels().map(|pixel| pixel.0[0]).collect();
+        assert_eq!(split, vec![0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_dark_panel_is_flipped_so_dim_text_stays_ink() {
+        // Background, bright glyph, background, dim glyph — the failing capture
+        // in miniature (Element's primary and secondary text on #1b1b1b).
+        let mut image = image::GrayImage::from_raw(4, 1, vec![27, 230, 27, 138]).expect("image");
+        autocontrast(&mut image);
+        assert!(paper_luma(&image) < 128, "a dark panel must be recognised");
+        invert(&mut image);
+        split_at(&mut image, DEFAULT_THRESHOLD);
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+            vec![255, 0, 255, 0],
+            "paper stays white, both the bright and the dim glyph stay ink"
+        );
+    }
+
+    #[test]
+    fn a_light_page_keeps_its_polarity() {
+        // Background, glyph, background, dim glyph on white paper.
+        let mut image = image::GrayImage::from_raw(4, 1, vec![255, 30, 255, 150]).expect("image");
+        autocontrast(&mut image);
+        assert!(
+            paper_luma(&image) >= 128,
+            "a light page must not be flipped"
+        );
+        split_at(&mut image, DEFAULT_THRESHOLD);
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+            vec![255, 0, 255, 0]
+        );
+    }
+
+    #[test]
+    fn a_flat_image_survives_autocontrast_unchanged() {
+        let mut image = image::GrayImage::from_raw(2, 1, vec![128, 128]).expect("image");
+        autocontrast(&mut image);
+        assert_eq!(
+            image.pixels().map(|pixel| pixel.0[0]).collect::<Vec<_>>(),
+            vec![128, 128]
+        );
+    }
+
+    #[test]
+    fn the_prepared_crop_is_binarised_and_enlarged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let image = dir.path().join("panel.png");
+        // Light glyph on a dark panel, like a menu label.
+        image::RgbaImage::from_raw(2, 1, vec![40, 40, 40, 255, 220, 220, 220, 255])
+            .expect("image")
+            .save(&image)
+            .expect("write test image");
+
+        let prepared = Prepared::open(&image, &Config::default()).expect("prepare");
+        assert_eq!((prepared.width, prepared.height, prepared.scale), (2, 1, 2));
+        let opened = image::open(&prepared.path).expect("read prepared");
+        assert_eq!((opened.width(), opened.height()), (4, 2));
+        let luma = opened.to_luma8();
+        assert!(
+            luma.pixels()
+                .all(|pixel| pixel.0[0] == 0 || pixel.0[0] == 255),
+            "every pixel handed to Tesseract must be one side of the threshold"
+        );
+        assert!(
+            luma.pixels().any(|pixel| pixel.0[0] == 255),
+            "the light glyph must survive the threshold"
+        );
+    }
+
+    #[test]
+    fn preprocessing_can_be_disabled_and_the_threshold_tuned() {
+        unsafe {
+            std::env::set_var(BINARIZE_VARIABLE, "off");
+            std::env::set_var(THRESHOLD_VARIABLE, "170");
+        }
+        let config = Config::from_env();
+        assert!(!config.binarize);
+        assert_eq!(config.threshold, 170);
+        unsafe {
+            std::env::set_var(BINARIZE_VARIABLE, "maybe");
+            std::env::set_var(THRESHOLD_VARIABLE, "300");
+        }
+        let config = Config::from_env();
+        assert!(config.binarize, "an unparseable switch keeps the default");
+        assert_eq!(config.threshold, DEFAULT_THRESHOLD);
+        unsafe {
+            std::env::remove_var(BINARIZE_VARIABLE);
+            std::env::remove_var(THRESHOLD_VARIABLE);
+        }
+    }
+
+    #[test]
+    fn no_preprocessing_at_scale_one_hands_over_the_original_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let image = dir.path().join("shot.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]))
+            .save(&image)
+            .expect("write test image");
+        let config = Config::default().with_binarize(false);
+        let prepared = Prepared::open(&image, &Config { scale: 1, ..config }).expect("prepare");
+        assert_eq!(prepared.path, image);
+        assert!(prepared._temps.is_empty());
+    }
+
+    #[test]
+    fn a_debug_directory_is_optional_and_never_panics() {
+        assert!(Debug::in_directory("").is_none());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let debug = Debug::in_directory(dir.path().to_str().unwrap()).expect("debug dir");
+        assert!(debug.dir().is_dir());
+        assert!(debug.dir().starts_with(dir.path()));
+    }
+
+    /// 60×100 stretched greyscale: a dark page with a light passage on rows
+    /// 30..70 and dark glyphs inside it — the selected-description capture in
+    /// miniature.
+    fn page_with_a_light_passage() -> image::GrayImage {
+        let mut image = image::GrayImage::from_pixel(60, 100, image::Luma([30]));
+        for y in 30..70 {
+            for x in 5..55 {
+                image.put_pixel(x, y, image::Luma([205]));
+            }
+        }
+        for y in 38..42 {
+            for x in (8..52).step_by(4) {
+                image.put_pixel(x, y, image::Luma([20]));
+                image.put_pixel(x + 1, y, image::Luma([20]));
+            }
+        }
+        image
+    }
+
+    /// 60×100 RGBA: a dark page with one light line of the page's own text on
+    /// rows 10..16, and a light passage on rows 40..80. The page's line is
+    /// strokes over a fifth of the row; the passage is mostly its own paper.
+    fn rgba_page_with_light_text() -> image::RgbaImage {
+        let mut image = image::RgbaImage::from_pixel(60, 100, image::Rgba([32, 32, 32, 255]));
+        for y in 10..16 {
+            for x in (6..54).step_by(4) {
+                image.put_pixel(x, y, image::Rgba([226, 226, 226, 255]));
+            }
+        }
+        for y in 40..80 {
+            for x in 5..55 {
+                image.put_pixel(x, y, image::Rgba([206, 226, 246, 255]));
+            }
+        }
+        image
+    }
+
+    fn rgba_capture() -> image::RgbaImage {
+        let mut image = image::RgbaImage::from_pixel(60, 100, image::Rgba([32, 32, 32, 255]));
+        for y in 30..70 {
+            for x in 5..55 {
+                image.put_pixel(x, y, image::Rgba([206, 226, 246, 255]));
+            }
+        }
+        for y in 38..42 {
+            for x in (8..52).step_by(3) {
+                image.put_pixel(x, y, image::Rgba([18, 18, 18, 255]));
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn the_light_passage_inside_a_dark_crop_is_found_as_an_unread_band() {
+        let image = page_with_a_light_passage();
+        assert!(paper_luma(&image) < 128, "the page names the polarity");
+        let bands = unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1);
+        assert_eq!(
+            bands,
+            vec![Band {
+                top: 30,
+                bottom: 70
+            }],
+            "the passage is one flat band of the opposite paper"
+        );
+    }
+
+    #[test]
+    fn a_dark_passage_inside_a_light_crop_is_found_too() {
+        // The mirror case: light page, dark block.
+        let mut image = image::GrayImage::from_pixel(60, 100, image::Luma([220]));
+        for y in 30..70 {
+            for x in 5..55 {
+                image.put_pixel(x, y, image::Luma([40]));
+            }
+        }
+        assert!(paper_luma(&image) >= 128);
+        let bands = unread_bands(&image, paper_luma(&image), DEFAULT_THRESHOLD, &[], 1);
+        assert_eq!(
+            bands,
+            vec![Band {
+                top: 30,
+                bottom: 70
+            }]
+        );
+    }
+
+    #[test]
+    fn rows_a_block_already_covers_are_not_read_again() {
+        let image = page_with_a_light_passage();
+        let covered = TextBlock {
+            bbox: Bbox {
+                x: 0,
+                y: 30,
+                width: 60,
+                height: 40,
+            },
+            text: "already read".to_string(),
+            confidence: 90.0,
+        };
+        assert!(unread_bands(&image, 30, DEFAULT_THRESHOLD, &[covered], 1).is_empty());
+    }
+
+    #[test]
+    fn a_busy_region_does_not_form_a_band() {
+        // A photo or an avatar: the opposite-pixel colour changes every row, so
+        // no flat run of rows survives — the retry must not read it upside
+        // down.
+        let mut image = image::GrayImage::from_pixel(60, 100, image::Luma([30]));
+        for y in 20..70 {
+            let value = if y % 2 == 0 { 140 } else { 250 };
+            for x in 0..20 {
+                image.put_pixel(x, y, image::Luma([value]));
+            }
+        }
+        assert!(unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1).is_empty());
+    }
+
+    #[test]
+    fn the_page_s_own_light_ink_never_forms_a_band() {
+        // A luma distance from the paper cannot tell the page's own light text
+        // from a light block: both sit on the far side of the split. A dropped
+        // page line became a band that way, was re-read upside down and could
+        // be repainted as a misreading. The page's ink is strokes over part of
+        // the row; a passage is mostly the other paper.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_page_with_light_text()
+            .save(&path)
+            .expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+        let bands = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert_eq!(
+            bands,
+            vec![Band {
+                top: 40 * prepared.scale,
+                bottom: 80 * prepared.scale
+            }],
+            "only the passage is a band; the page's own line is not"
+        );
+    }
+
+    #[test]
+    fn a_line_of_ink_with_a_rule_under_it_is_not_a_band() {
+        // A rule or an underline is one long run of the other colour inside a
+        // line of the other ink, so "one row is paper" is not enough: a band
+        // needs a quarter of its rows to be paper, which a struck-through or
+        // underlined line does not have.
+        let mut image = image::GrayImage::from_pixel(60, 100, image::Luma([30]));
+        for y in 20..32 {
+            for x in (6..54).step_by(4) {
+                image.put_pixel(x, y, image::Luma([226]));
+            }
+        }
+        // One row of rule, the width of the line.
+        for x in 6..54 {
+            image.put_pixel(x, 27, image::Luma([226]));
+        }
+        assert!(
+            unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1).is_empty(),
+            "one rule row in twelve is not a passage"
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_paper_row_is_not_retried() {
+        // The rule assumes a passage has padding — paper in a passage is an
+        // area. A block cropped flush to its glyph columns has no paper row at
+        // all, so it is not retried and keeps its pixels.
+        let mut image = image::GrayImage::from_pixel(200, 100, image::Luma([30]));
+        for y in 30..70 {
+            for x in 10..190 {
+                image.put_pixel(x, y, image::Luma([220]));
+            }
+        }
+        for x in (10..180).step_by(16) {
+            for y in 30..70 {
+                for dx in 0..10 {
+                    image.put_pixel(x + dx, y, image::Luma([20]));
+                }
+            }
+        }
+        assert!(
+            unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1).is_empty(),
+            "a flush block has no paper row to make it a band"
+        );
+    }
+
+    #[test]
+    fn only_new_lines_inside_the_band_are_recovered() {
+        let band = Band {
+            top: 30,
+            bottom: 70,
+        };
+        let existing = TextBlock {
+            bbox: Bbox {
+                x: 0,
+                y: 8,
+                width: 50,
+                height: 10,
+            },
+            text: "page line".to_string(),
+            confidence: 90.0,
+        };
+        let candidate = |y: u32, text: &str| TextBlock {
+            bbox: Bbox {
+                x: 5,
+                y,
+                width: 50,
+                height: 8,
+            },
+            text: text.to_string(),
+            confidence: 88.0,
+        };
+        let kept = recovered(
+            std::slice::from_ref(&existing),
+            vec![
+                candidate(9, "duplicate of the page line"),
+                candidate(40, "the selected passage"),
+                candidate(80, "below the band"),
+            ],
+            band,
+            1,
+        );
+        assert_eq!(kept.len(), 1, "{kept:#?}");
+        assert_eq!(kept[0].text, "the selected passage");
+    }
+
+    #[test]
+    fn the_band_crop_reads_what_the_primary_image_folded_away() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_capture().save(&path).expect("write capture");
+
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+        assert!(prepared.paper < 128, "the page names the crop's polarity");
+        let bands = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert_eq!(bands.len(), 1);
+        let band = bands[0];
+
+        // The primary image Tesseract saw first: the passage is a solid ink
+        // bar. This is the defect, mechanically.
+        let primary = image::open(&prepared.path)
+            .expect("read primary")
+            .to_luma8();
+        let black_share = |image: &image::GrayImage, top: u32, bottom: u32| {
+            let mut black = 0u32;
+            let mut total = 0u32;
+            for y in top..bottom {
+                for x in 0..image.width() {
+                    total += 1;
+                    if image.get_pixel(x, y)[0] == 0 {
+                        black += 1;
+                    }
+                }
+            }
+            black as f32 / total.max(1) as f32
+        };
+        assert!(
+            black_share(&primary, band.top, band.bottom) > 0.6,
+            "the passage must be folded into the background before the retry"
+        );
+
+        // The retry image: the passage's own paper is white and its glyphs are
+        // ink, so Tesseract can read the lines it never saw.
+        let (crop, started_at) = prepared.band_crop(band).expect("band crop");
+        let luma = image::open(crop.path()).expect("read band").to_luma8();
+        let top = band.top - started_at;
+        let bottom = top + band.height();
+        let share = black_share(&luma, top, bottom);
+        assert!(
+            (0.02..0.6).contains(&share),
+            "the passage's glyphs must be ink on its own paper, got {share}"
+        );
+    }
+
+    #[test]
+    fn the_band_crop_reports_the_row_it_starts_at() {
+        // The margin above the band is real, so the caller must offset by the
+        // row the crop starts at and not by the band's own top: getting this
+        // wrong moved every recovered box four prepared rows down.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_capture().save(&path).expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+        let luma = prepared.luma.as_ref().expect("greyscale kept").clone();
+
+        let band = Band {
+            top: 40,
+            bottom: 90,
+        };
+        let (crop, started_at) = prepared.band_crop(band).expect("band crop");
+        assert_eq!(started_at, band.top - BAND_MARGIN);
+
+        let crop = image::open(crop.path()).expect("read band").to_luma8();
+        assert_eq!(crop.height(), band.height() + 2 * BAND_MARGIN);
+        let mut expected = luma;
+        binarise(&mut expected, !prepared.inverted, prepared.threshold);
+        for y in 0..crop.height() {
+            for x in 0..crop.width() {
+                assert_eq!(
+                    crop.get_pixel(x, y),
+                    expected.get_pixel(x, started_at + y),
+                    "crop row {y} is prepared row {}",
+                    started_at + y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn more_bands_than_the_cap_keep_the_tallest_in_page_order() {
+        // A two-column page is one narrow band per strip. Refusing every band
+        // on the count skipped exactly the layout the retry exists for.
+        // Six strips, the fifth taller than the rest: a bare truncate keeps the
+        // first four and drops the tall one, which is the mutant this pins.
+        let strips: [(u32, u32); 6] = [
+            (10, 20),
+            (40, 20),
+            (70, 20),
+            (100, 20),
+            (130, 40),
+            (180, 20),
+        ];
+        let mut image = image::GrayImage::from_pixel(60, 210, image::Luma([30]));
+        for (top, height) in strips {
+            for y in top..(top + height) {
+                // Narrow enough that the dark page still names the crop's
+                // polarity: the strips are the minority of the pixels.
+                for x in 15..45 {
+                    image.put_pixel(x, y, image::Luma([220]));
+                }
+            }
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        image.save(&path).expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+
+        let all = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert_eq!(all.len(), 6, "{all:?}");
+
+        let mut reading = Reading::default();
+        reading.blocks.push(TextBlock {
+            bbox: Bbox {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 2,
+            },
+            text: "page".to_string(),
+            confidence: 90.0,
+        });
+        let kept = retry_bands(&prepared, &reading);
+        let scale = prepared.scale;
+        assert_eq!(kept.len(), MAX_RETRY_BANDS, "{kept:?}");
+        assert_eq!(
+            kept.iter().map(|band| band.top / scale).collect::<Vec<_>>(),
+            vec![10, 40, 70, 130],
+            "the tall strip survives, the fourth short one gives way"
+        );
+        assert!(
+            !kept.iter().any(|band| band.top == 100 * scale),
+            "the first four are not simply kept"
+        );
+        assert_eq!(
+            kept[3].height(),
+            40 * scale,
+            "the tall strip is the one kept"
+        );
+    }
+
+    #[test]
+    fn a_band_shorter_than_the_scaled_floor_is_dropped() {
+        // 12 prepared rows is a real band at 1× (12 capture px) and a sliver at
+        // 2× (6 capture px), so the same band must be kept at one scale and
+        // dropped at the other.
+        let band = Band { top: 0, bottom: 12 };
+        let mut kept = Vec::new();
+        push_band(&mut kept, band, 1, band.height());
+        assert_eq!(kept, vec![band], "12 capture rows is already a band");
+
+        let mut dropped = Vec::new();
+        push_band(&mut dropped, band, 2, band.height());
+        assert!(
+            dropped.is_empty(),
+            "at 2× the floor is 16 prepared rows, got 12"
+        );
+    }
+
+    #[test]
+    fn a_crop_the_primary_pass_read_nothing_from_is_not_retried() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("capture.png");
+        rgba_capture().save(&path).expect("write capture");
+        let config = Config::default();
+        let prepared = Prepared::open(&path, &config).expect("prepare");
+
+        // The passage is a band in the pixels …
+        let bands = unread_bands(
+            prepared.luma.as_ref().expect("greyscale kept"),
+            prepared.paper,
+            config.threshold,
+            &[],
+            prepared.scale,
+        );
+        assert!(!bands.is_empty(), "the fixture holds a band to find");
+
+        // … but a reading with no recognised line is not "a block inside a
+        // page": the whole crop's polarity is the question there, and this
+        // retry must not invert it wholesale.
+        assert!(
+            retry_bands(&prepared, &Reading::default()).is_empty(),
+            "no recognised line means no retry"
+        );
+
+        // One recognised line is enough to make the band meaningful.
+        let mut reading = Reading::default();
+        reading.blocks.push(TextBlock {
+            bbox: Bbox {
+                x: 0,
+                y: 2,
+                width: 10,
+                height: 6,
+            },
+            text: "page".to_string(),
+            confidence: 90.0,
+        });
+        assert_eq!(retry_bands(&prepared, &reading).len(), 1);
+    }
+}

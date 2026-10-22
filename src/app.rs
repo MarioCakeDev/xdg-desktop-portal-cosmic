@@ -52,6 +52,29 @@ pub struct CosmicPortal {
     pub dummy_id: window::Id,
 }
 
+impl CosmicPortal {
+    /// Persist the screenshot settings.
+    ///
+    /// This is the only place that writes them. `set_screenshot` only touches
+    /// the file when the value differs from `self.config.screenshot`, so the
+    /// in-memory copy must not be updated before this call: doing that turns
+    /// the save into a silent no-op (the language pick used to disappear that
+    /// way). On a change the setter installs `screenshot` as the new in-memory
+    /// value before attempting the write, so a later Choice/Location save keeps
+    /// it; after a failed write memory is ahead of the file, and the next
+    /// full-struct save heals it.
+    pub(crate) fn save_screenshot_config(&mut self, screenshot: config::screenshot::Screenshot) {
+        match &mut self.config_handler {
+            Some(handler) => {
+                if let Err(e) = self.config.set_screenshot(handler, screenshot) {
+                    tracing::error!("Failed to save screenshot config: {e}")
+                }
+            }
+            None => tracing::error!("Failed to save config: No config handler"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputState {
     pub output: WlOutput,
@@ -285,15 +308,7 @@ impl cosmic::Application for CosmicPortal {
                 cosmic::iced::Task::none()
             }
             Msg::ConfigSetScreenshot(screenshot) => {
-                match &mut self.config_handler {
-                    Some(handler) => {
-                        if let Err(e) = self.config.set_screenshot(handler, screenshot) {
-                            tracing::error!("Failed to save screenshot config: {e}")
-                        }
-                    }
-                    None => tracing::error!("Failed to save config: No config handler"),
-                }
-
+                self.save_screenshot_config(screenshot);
                 cosmic::iced::Task::none()
             }
             Msg::ConfigSubUpdate(config) => {

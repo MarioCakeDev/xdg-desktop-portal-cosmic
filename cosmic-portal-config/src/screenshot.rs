@@ -18,6 +18,14 @@ pub struct Screenshot {
     pub choice: Choice,
     #[serde(default)]
     pub last_rectangle: Option<Rect>,
+    /// The target language last picked in the translate toolbar, as a
+    /// `lang::LANGS` code (`de`, `ja`, …). `None` means it has never been
+    /// picked: the dialog then opens on the session locale, as before.
+    ///
+    /// Written when the picker changes, not when a translation succeeds, so an
+    /// aborted or failed translate cannot lose the choice.
+    #[serde(default)]
+    pub target_language: Option<String>,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
