@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a5b72d6513c4d38b015053b55874d1b0f1f3dff7 (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at abfcd029232c4c58081cc6403a54b9803c6a9324 (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -14,12 +14,23 @@
 //! binarised before recognition (grey, histogram stretch, hard threshold),
 //! because game UI is anti-aliased light text on a dark panel and Tesseract
 //! reads the soft edges as strokes — `Advancements` comes back as
-//! `AYancernrentS` on the raw pixels; the crop is then enlarged, because
-//! Tesseract wants roughly 30 px tall glyphs and a 20 px menu label is below
-//! that; one uniform-block pass (6) reads it, with a sparse-text pass (11) only
-//! when that keeps fewer than two lines; and a line made mostly of punctuation
-//! is dropped instead of being handed to the translator. Nothing here invents
-//! text: every block comes from a Tesseract pass over the pixels.
+//! `AYancernrentS` on the raw pixels; the crop is then enlarged with nearest
+//! neighbour, because the font is already a bitmap and interpolation only
+//! blurs its strokes; one uniform-block pass (6) reads it, with a sparse-text
+//! pass (11) only when that keeps fewer than two lines; and a line made mostly
+//! of punctuation is dropped instead of being handed to the translator.
+//!
+//! Paint boxes are built from **words**, never from Tesseract's line box. A
+//! line box can start at a button's border glyph and can span two columns:
+//! painting it covers art and drops the translation far left of its label.
+//! Words with no letters are dropped, the rest are clustered by horizontal gap,
+//! and each cluster is translated and painted on its own.
+//!
+//! Nothing here invents text: every block comes from a Tesseract pass over the
+//! pixels, and the optional corrector in [`spellfix`] only replaces a token
+//! with a vocabulary word that is one or two edits away.
+
+mod spellfix;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,6 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::imageops::FilterType;
+
+pub use spellfix::Correction;
 
 /// Every language pack the tool is prepared to read. The install recipe ships
 /// all of them; a narrower set can be selected with
@@ -57,6 +70,10 @@ pub const BINARIZE_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_BINARIZE";
 /// Luma split point for the binarised crop (`1`–`254`). Raise it for a dim
 /// capture, lower it when panel shading bleeds into the glyphs.
 pub const THRESHOLD_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_THRESHOLD";
+
+/// Set to `0`/`false`/`off` to hand the translator exactly what Tesseract read,
+/// without the small UI-vocabulary corrector.
+pub const SPELLFIX_VARIABLE: &str = "COSMIC_SCREENSHOT_OCR_SPELLFIX";
 
 /// Light UI text on a dark panel separates cleanly at 150.
 pub const DEFAULT_THRESHOLD: u8 = 150;
@@ -157,6 +174,8 @@ pub struct Reading {
     pub elapsed_ms: u128,
     /// Every reading of this image that was tried.
     pub attempts: Vec<Attempt>,
+    /// Tokens the UI corrector replaced, in the order it fired.
+    pub corrections: Vec<Correction>,
 }
 
 impl Reading {
@@ -254,6 +273,9 @@ pub struct Config {
     pub binarize: bool,
     /// Luma split point for [`Config::binarize`], `1..=254`.
     pub threshold: u8,
+    /// Repair tokens that are one or two edits from a known UI word. Off
+    /// leaves the translator with exactly what Tesseract read.
+    pub spellfix: bool,
     /// Lines below this mean confidence are dropped.
     pub min_confidence: f32,
     /// When set, write the OCR input and the raw TSV under this directory.
@@ -269,6 +291,7 @@ impl Default for Config {
             scale: 2,
             binarize: true,
             threshold: DEFAULT_THRESHOLD,
+            spellfix: true,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             debug: None,
         }
@@ -311,6 +334,12 @@ impl Config {
         {
             config.threshold = threshold;
         }
+        if let Some(spellfix) = std::env::var(SPELLFIX_VARIABLE)
+            .ok()
+            .and_then(|value| parse_switch(&value))
+        {
+            config.spellfix = spellfix;
+        }
         if let Some(debug) = Debug::from_env() {
             config.debug = Some(debug);
         }
@@ -334,6 +363,11 @@ impl Config {
 
     pub fn with_threshold(mut self, threshold: u8) -> Self {
         self.threshold = threshold.clamp(1, 254);
+        self
+    }
+
+    pub fn with_spellfix(mut self, spellfix: bool) -> Self {
+        self.spellfix = spellfix;
         self
     }
 
@@ -514,7 +548,11 @@ impl Prepared {
         }
 
         let prepared = if scale > 1 {
-            opened.resize_exact(width * scale, height * scale, FilterType::Lanczos3)
+            // Nearest neighbour, not Lanczos: a pixel font is already a grid of
+            // hard-edged blocks, and interpolation turns each stroke into a
+            // grey ramp that the threshold then erodes unevenly (`B`/`G`/`F`
+            // become each other). Exact doubling keeps every block exact.
+            opened.resize_exact(width * scale, height * scale, FilterType::Nearest)
         } else {
             opened
         };
@@ -614,7 +652,7 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
     }
 
     let tsv = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_tsv(&tsv);
+    let (parsed, corrections) = parse_tsv_with(&tsv, config.spellfix);
     let found = parsed.len();
     let mut blocks = Vec::with_capacity(found);
     let mut low_confidence = 0;
@@ -640,6 +678,7 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
         scale: prepared.scale,
         elapsed_ms: started.elapsed().as_millis(),
         attempts: Vec::new(),
+        corrections,
     };
 
     if let Some(debug) = &config.debug {
@@ -657,7 +696,7 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
             tsv.as_bytes(),
         ));
         let summary = format!(
-            "languages: {}\npsm: {psm}\nscale: {}\npreprocess: {}\ninput: {}x{} (enlarged {}x{})\nfound: {}\nkept: {}\ndropped (confidence < {}): {}\ndropped (unreadable): {}\nelapsed: {} ms\n",
+            "languages: {}\npsm: {psm}\nscale: {}\npreprocess: {}\ninput: {}x{} (enlarged {}x{})\nfound: {}\nkept: {}\ndropped (confidence < {}): {}\ndropped (unreadable): {}\ncorrected: {}\nelapsed: {} ms\n",
             config.languages,
             prepared.scale,
             if config.binarize {
@@ -674,6 +713,7 @@ fn run_pass(prepared: &Prepared, config: &Config, psm: u8) -> Result<Reading, Oc
             config.min_confidence,
             reading.dropped_low_confidence,
             reading.dropped_unreadable,
+            reading.corrections.len(),
             started.elapsed().as_millis(),
         );
         note(std::fs::write(debug.path(&format!("{stem}.txt")), summary));
@@ -692,8 +732,10 @@ fn last_line(text: &str) -> String {
         .collect()
 }
 
-/// Is this line worth translating? Real UI text has letters; a textured button
-/// can make Tesseract emit `|||` or `}{`, which must not become "text".
+/// Is this block worth translating? Real UI text has at least three letters
+/// (or is a well-known two-letter label such as `OK`); a textured button can
+/// make Tesseract emit `|||` or `}{`, and an icon can yield `Ei`, which must
+/// not become "text".
 fn is_readable(text: &str) -> bool {
     let mut letters = 0usize;
     let mut other = 0usize;
@@ -704,20 +746,54 @@ fn is_readable(text: &str) -> bool {
             other += 1;
         }
     }
-    letters >= 2 && other * 2 <= letters + other
+    let enough = letters >= 3 || is_short_ui_label(text);
+    enough && other * 2 <= letters + other
 }
 
-#[derive(Default)]
-struct LineAccumulator {
-    bbox: Option<Bbox>,
-    words: Vec<(u32, String)>,
+/// Two-letter UI words that are real labels, not fragments. An icon read as
+/// `Ei` is not on this list.
+const SHORT_LABELS: [&str; 5] = ["ok", "no", "on", "up", "go"];
+
+fn is_short_ui_label(text: &str) -> bool {
+    let trimmed = text.trim_matches(|character: char| !character.is_alphanumeric());
+    SHORT_LABELS.contains(&trimmed.to_lowercase().as_str())
+}
+
+/// One word Tesseract returned, kept with its own box so paint areas can be
+/// built from words rather than from the line.
+#[derive(Clone, Debug)]
+struct Word {
+    bbox: Bbox,
+    /// Tesseract's word index within the line: reading order, which is not the
+    /// same as left-to-right for a right-to-left script.
+    number: u32,
+    text: String,
     confidence: f32,
 }
 
-/// Parse Tesseract's TSV output (one row per word) into line-level blocks.
+/// Parse Tesseract's TSV output (one row per word) into paint-sized blocks.
+///
+/// A block is a cluster of words, not a Tesseract line: the line box starts at
+/// a button border when the border was read as a glyph, and psm 6 merges two
+/// button columns into a single line. See [`parse_tsv_with`].
 pub fn parse_tsv(tsv: &str) -> Vec<TextBlock> {
-    let mut lines: Vec<((u32, u32, u32, u32), LineAccumulator)> = Vec::new();
-    let mut index: HashMap<(u32, u32, u32, u32), usize> = HashMap::new();
+    parse_tsv_with(tsv, false).0
+}
+
+/// Parse the TSV, optionally repairing OCR typos, and report the repairs.
+///
+/// Level-5 rows are grouped by Tesseract's line key, then:
+///
+/// 1. tokens with no letters (`|`, `}`, `..`) are dropped — the first token on
+///    a button line is often its border, which must not anchor the paint box;
+/// 2. the remaining words are clustered by horizontal gap, so one line that
+///    spans `Give Feedback` and `Report Bugs` becomes two blocks;
+/// 3. each cluster's box is the union of its words, and its text is those
+///    words in reading order.
+pub fn parse_tsv_with(tsv: &str, spellfix: bool) -> (Vec<TextBlock>, Vec<Correction>) {
+    type LineKey = (u32, u32, u32, u32);
+    let mut lines: Vec<(LineKey, Vec<Word>)> = Vec::new();
+    let mut index: HashMap<LineKey, usize> = HashMap::new();
 
     for row in tsv.lines() {
         let columns: Vec<&str> = row.split('\t').collect();
@@ -766,46 +842,138 @@ pub fn parse_tsv(tsv: &str) -> Vec<TextBlock> {
 
         let key = (page, block, paragraph, line);
         let position = *index.entry(key).or_insert_with(|| {
-            lines.push((key, LineAccumulator::default()));
+            lines.push((key, Vec::new()));
             lines.len() - 1
         });
-        let accumulator = &mut lines[position].1;
-        let bbox = Bbox {
-            x,
-            y,
-            width,
-            height,
-        };
-        match &mut accumulator.bbox {
-            Some(existing) => existing.union(bbox),
-            None => accumulator.bbox = Some(bbox),
-        }
-        accumulator.words.push((word, text.to_string()));
-        accumulator.confidence += confidence;
+        lines[position].1.push(Word {
+            bbox: Bbox {
+                x,
+                y,
+                width,
+                height,
+            },
+            number: word,
+            text: text.to_string(),
+            confidence,
+        });
     }
 
-    let mut blocks: Vec<TextBlock> = lines
+    let mut lines: Vec<Vec<Word>> = lines
         .into_iter()
-        .filter_map(|(_, mut accumulator)| {
-            let bbox = accumulator.bbox?;
-            accumulator.words.sort_by_key(|(word, _)| *word);
-            let words: Vec<&str> = accumulator
-                .words
-                .iter()
-                .map(|(_, word)| word.as_str())
-                .collect();
-            let count = words.len().max(1) as f32;
-            Some(TextBlock {
-                bbox,
-                text: join_words(&words),
-                confidence: accumulator.confidence / count,
-            })
+        .map(|(_, mut words)| {
+            // A token without a letter is decoration, not a label.
+            words.retain(|word| word.text.chars().any(char::is_alphabetic));
+            words
         })
+        .filter(|words| !words.is_empty())
         .collect();
+
+    // Two-word lines (one label per column) have no usable local median gap, so
+    // they borrow the page's idea of a word gap.
+    let global_gap = median_gap(lines.iter().map(Vec::as_slice));
+
+    let mut blocks = Vec::new();
+    let mut corrections = Vec::new();
+    for words in &mut lines {
+        words.sort_by_key(|word| (word.number, word.bbox.x));
+        let tokens: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+        if spellfix {
+            let (repaired, fired) = spellfix::correct_line(&tokens);
+            corrections.extend(fired);
+            for (word, text) in words.iter_mut().zip(repaired) {
+                word.text = text;
+            }
+        }
+
+        words.sort_by_key(|word| (word.bbox.x, word.number));
+        for cluster in cluster_line(words, global_gap) {
+            let mut bbox: Option<Bbox> = None;
+            let mut confidence = 0.0;
+            let mut texts = Vec::with_capacity(cluster.len());
+            for word in &cluster {
+                match &mut bbox {
+                    Some(existing) => existing.union(word.bbox),
+                    None => bbox = Some(word.bbox),
+                }
+                confidence += word.confidence;
+                texts.push(word.text.as_str());
+            }
+            let Some(bbox) = bbox else { continue };
+            blocks.push(TextBlock {
+                bbox,
+                text: join_words(&texts),
+                confidence: confidence / cluster.len().max(1) as f32,
+            });
+        }
+    }
 
     // Reading order: top to bottom, then left to right.
     blocks.sort_by_key(|block| (block.bbox.y, block.bbox.x));
-    blocks
+    (blocks, corrections)
+}
+
+/// Split a left-to-right-sorted line into label clusters.
+///
+/// A gap wider than twice the line's median word gap starts a new block; a gap
+/// wider than 1.2 line heights always does, so two words on opposite sides of a
+/// wide button are never painted as one. When a line has fewer than two gaps
+/// (one or two words) there is no local median, so the page median is used.
+fn cluster_line(words: &[Word], global_gap: Option<u32>) -> Vec<Vec<&Word>> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let gaps: Vec<u32> = words
+        .windows(2)
+        .map(|pair| pair[1].bbox.x.saturating_sub(pair[0].bbox.right()))
+        .collect();
+    let height = median_value(words.iter().map(|word| word.bbox.height)).unwrap_or(1);
+    let basis = if gaps.len() >= 2 {
+        median_value(gaps.iter().copied())
+    } else {
+        global_gap
+    }
+    .unwrap_or(height / 2)
+    .max(1);
+    let split = ((basis as f32 * 2.0).max(height as f32 * 1.2)).round() as u32;
+
+    let mut clusters: Vec<Vec<&Word>> = Vec::new();
+    let mut current = vec![&words[0]];
+    for (position, pair) in words.windows(2).enumerate() {
+        if gaps[position] > split {
+            clusters.push(std::mem::take(&mut current));
+        }
+        current.push(&pair[1]);
+    }
+    clusters.push(current);
+    for cluster in &mut clusters {
+        cluster.sort_by_key(|word| word.number);
+    }
+    clusters
+}
+
+fn median_gap<'a>(lines: impl Iterator<Item = &'a [Word]>) -> Option<u32> {
+    let mut gaps = Vec::new();
+    for words in lines {
+        let mut ordered: Vec<&Word> = words.iter().collect();
+        ordered.sort_by_key(|word| (word.bbox.x, word.number));
+        gaps.extend(
+            ordered
+                .windows(2)
+                .map(|pair| pair[1].bbox.x.saturating_sub(pair[0].bbox.right())),
+        );
+    }
+    median_value(gaps.into_iter())
+}
+
+fn median_value(values: impl Iterator<Item = u32>) -> Option<u32> {
+    let mut values: Vec<u32> = values.collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    // Lower median: with two gaps, one of which is the gap between columns, the
+    // smaller one is the word gap we want to measure against.
+    Some(values[(values.len() - 1) / 2])
 }
 
 /// Join OCR words into a line. CJK scripts have no inter-word spaces, so a
@@ -881,6 +1049,109 @@ mod tests {
         assert!((blocks[0].confidence - 92.5).abs() < 0.01);
         assert_eq!(blocks[1].text, "Wie geht es dir?");
         assert_eq!(blocks[1].bbox.y, 90);
+    }
+
+    #[test]
+    fn paint_boxes_come_from_words_not_the_line() {
+        let blocks = parse_tsv(include_str!("../tests/fixtures/menu-psm6.tsv"));
+        let texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Bane Menu",
+                "Back to Game",
+                "Give Feedback",
+                "Report Bugs",
+                "Advancements",
+                "Statistics",
+                "Options...",
+                "Achievements",
+                "Mods",
+                "Disconnect",
+            ]
+        );
+        assert!(
+            blocks.iter().all(|block| !block.text.contains('|')),
+            "a border glyph must never become text: {texts:?}"
+        );
+
+        // The dump's line box was x=342 w=1595, anchored on the button border.
+        // The words start at 1167 and end at 1937.
+        let back = &blocks[1];
+        assert_eq!(back.bbox.x, 1167, "paint box must start at the first word");
+        assert_eq!(
+            back.bbox.width, 770,
+            "and not include the border or the gap"
+        );
+
+        let on_row = |y: u32| blocks.iter().filter(|block| block.bbox.y == y).count();
+        assert_eq!(
+            on_row(930),
+            2,
+            "Give Feedback and Report Bugs are two buttons"
+        );
+        assert_eq!(
+            on_row(1214),
+            2,
+            "Advancements and Statistics are two columns"
+        );
+        assert_eq!(on_row(1502), 2, "Options and Achievements are two columns");
+    }
+
+    #[test]
+    fn three_words_on_one_line_still_split_at_a_column_gap() {
+        // Two words of one label and one word of the next column: with only two
+        // gaps, the upper median would be the column gap itself and nothing
+        // would split. The lower median keeps the word gap as the measure.
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   5\t1\t1\t1\t1\t1\t0\t0\t100\t100\t90\tGive\n\
+                   5\t1\t1\t1\t1\t2\t150\t0\t300\t100\t90\tFeedback\n\
+                   5\t1\t1\t1\t1\t3\t800\t0\t250\t100\t90\tReport\n";
+        let blocks = parse_tsv(tsv);
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert_eq!(blocks[0].text, "Give Feedback");
+        assert_eq!(blocks[1].text, "Report");
+    }
+
+    #[test]
+    fn the_corrector_repairs_menu_tokens_and_is_reported() {
+        let tsv = include_str!("../tests/fixtures/menu-psm6.tsv");
+        let (blocks, corrections) = parse_tsv_with(tsv, true);
+        assert_eq!(blocks[0].text, "Game Menu");
+        assert_eq!(
+            corrections,
+            vec![Correction {
+                from: "Bane".to_string(),
+                to: "Game".to_string(),
+                distance: 2,
+            }],
+            "only the ambiguous title token needs the phrase to settle it"
+        );
+
+        let (plain, none) = parse_tsv_with(tsv, false);
+        assert_eq!(plain[0].text, "Bane Menu");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn two_letter_fragments_are_not_text_but_real_short_labels_are() {
+        assert!(!is_readable("Ei"), "a mod icon is not a menu label");
+        assert!(!is_readable("|"));
+        assert!(is_readable("OK"));
+        assert!(is_readable("No"));
+        assert!(is_readable("Back to Game"));
+    }
+
+    #[test]
+    fn the_corrector_can_be_switched_off_from_the_environment() {
+        unsafe { std::env::set_var(SPELLFIX_VARIABLE, "off") };
+        assert!(!Config::from_env().spellfix);
+        unsafe {
+            std::env::set_var(SPELLFIX_VARIABLE, "on");
+            assert!(Config::from_env().spellfix);
+            std::env::remove_var(SPELLFIX_VARIABLE);
+        }
+        assert!(Config::from_env().spellfix, "on by default");
     }
 
     #[test]

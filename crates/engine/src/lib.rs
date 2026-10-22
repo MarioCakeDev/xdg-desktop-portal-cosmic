@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at a5b72d6513c4d38b015053b55874d1b0f1f3dff7 (crates/engine).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at abfcd029232c4c58081cc6403a54b9803c6a9324 (crates/engine).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! The translate-the-capture pipeline: OCR, auto-detect, translate, overlay.
@@ -183,6 +183,18 @@ pub fn translate_canvas(
         .map(|debug| debug.dir().to_path_buf());
 
     let (reading, source, mut trace) = recognize_blocks(&effective, translator, recognize)?;
+    for correction in &reading.corrections {
+        trace.push(format!(
+            "corrected: '{}' -> '{}' ({})",
+            correction.from,
+            correction.to,
+            if correction.distance == 1 {
+                "1 edit".to_string()
+            } else {
+                format!("{} edits", correction.distance)
+            }
+        ));
+    }
 
     if reading.blocks.is_empty() {
         // No text at all is the existing one-line error. Text that Tesseract
@@ -988,5 +1000,40 @@ mod tests {
             ..Applied::default()
         };
         assert_eq!(applied.counts(), "found 10, kept 9, translated 9, drawn 1");
+    }
+
+    #[test]
+    fn the_report_names_every_corrected_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "cosmic-screenshot-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut request = request();
+        request.ocr.debug = ocr::Debug::in_directory(dir.to_str().unwrap());
+
+        let mut corrected = reading("eng", 6, &["Game Menu", "Back to Game"]);
+        corrected.corrections = vec![ocr::Correction {
+            from: "Bane".to_string(),
+            to: "Game".to_string(),
+            distance: 2,
+        }];
+        let translator = FakeTranslator::new("[de] ");
+        let mut canvas = Canvas::filled(120, 60, [255, 255, 255, 255]);
+        let applied = translate_canvas(&mut canvas, &request, &translator, &|_| {
+            Ok(corrected.clone())
+        })
+        .expect("the run succeeds");
+
+        let debug_dir = applied.debug_dir.expect("a debug directory");
+        let report = std::fs::read_to_string(debug_dir.join("report.txt")).expect("report");
+        assert!(
+            report.contains("corrected: 'Bane' -> 'Game' (2 edits)"),
+            "the dump must show when the corrector fired: {report}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
