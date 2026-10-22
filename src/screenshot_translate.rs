@@ -352,7 +352,6 @@ mod tests {
             image: Arc::new(patch),
             target: lang::find("de").expect("German is in the table"),
             source: "English".into(),
-            lines: 1,
             drawn: 1,
             found: 1,
             kept: 1,
