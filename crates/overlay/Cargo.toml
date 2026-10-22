@@ -1,0 +1,11 @@
+[package]
+name = "cosmic-screenshot-overlay"
+version = "1.11.0"
+edition = "2024"
+description = "Lens-style in-place overlay of translated text onto a captured image"
+license = "GPL-3.0-only"
+
+[dependencies]
+ab_glyph = "0.2"
+fontdb = "0.23"
+image = { version = "0.25", default-features = false, features = ["png"] }

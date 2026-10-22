@@ -23,6 +23,7 @@ mod screencast;
 mod screencast_dialog;
 mod screencast_thread;
 mod screenshot;
+mod screenshot_translate;
 mod subscription;
 mod wayland;
 mod widget;
@@ -363,6 +364,14 @@ fn main() -> cosmic::iced::Result {
         .unwrap();
 
     log_panics::init();
+
+    // One line at startup so the owner can prove which binary is running before
+    // and after an install. `warn!` because the default filter is WARN: an
+    // `info!` line would not appear in the journal without RUST_LOG=info.
+    tracing::warn!(
+        "xdg-desktop-portal-cosmic TRANSLATE BUILD {} — screenshot dialog with in-place Translate",
+        env!("CARGO_PKG_VERSION")
+    );
 
     localize::localize();
 

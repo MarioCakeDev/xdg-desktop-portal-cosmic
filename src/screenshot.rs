@@ -28,10 +28,13 @@ use zbus::zvariant;
 use crate::app::{CosmicPortal, OutputState};
 use crate::config::screenshot::ImageSaveLocation;
 use crate::config::{self};
+use crate::screenshot_translate::{self as translate, LogicalRect, Region};
 use crate::wayland::{CaptureSource, ShmImage, WaylandHelper};
 use crate::widget::keyboard_wrapper::KeyboardWrapper;
 use crate::widget::rectangle_selection::DragState;
+use crate::widget::screenshot::TranslateControls;
 use crate::{PortalResponse, fl, subscription};
+use cosmic_screenshot_engine::lang;
 
 #[derive(Clone, Debug)]
 pub struct ScreenshotImage {
@@ -382,6 +385,14 @@ pub enum Msg {
     OutputChanged(WlOutput),
     WindowChosen(String, usize),
     Location(usize),
+    /// Translate the selected area of this dialog's output, in place.
+    Translate {
+        output: String,
+    },
+    /// A new target language was picked for the next translation.
+    TargetLanguage(usize),
+    /// The background task finished: the repainted region, or one line of why.
+    Translated(Result<translate::Translated, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +436,39 @@ pub struct Args {
     pub choice: Choice,
     pub location: ImageSaveLocation,
     pub action: Action,
+    /// The untouched capture of each output. Translate always repaints these,
+    /// so translating twice (or into a second language) cannot compound two
+    /// overlays on the same glyphs.
+    pub pristine: HashMap<String, RgbaImage>,
+    /// Index into [`lang::LANGS`]: the target of the next translation.
+    pub target_index: usize,
+    /// A translation is running. The dialog stays usable; the button says so.
+    pub translating: bool,
+    /// One line under the toolbar: the result, or the reason it failed.
+    pub status: Option<String>,
+}
+
+impl Args {
+    /// The chosen target language. `LANGS` is non-empty and the index is only
+    /// ever set from a valid dropdown selection.
+    fn target(&self) -> &'static lang::LangInfo {
+        lang::LANGS
+            .get(self.target_index)
+            .unwrap_or(&lang::LANGS[0])
+    }
+}
+
+/// The target the dialog opens with: the session's language when it is one of
+/// the 23 targets, English otherwise. The owner can change it in the toolbar.
+fn target_index() -> usize {
+    lang::from_locale()
+        .and_then(|info| lang::LANGS.iter().position(|row| row.code == info.code))
+        .unwrap_or_else(|| {
+            lang::LANGS
+                .iter()
+                .position(|row| row.code == "en")
+                .unwrap_or(0)
+        })
 }
 
 struct Output {
@@ -496,6 +540,12 @@ impl Screenshot {
                 .interactive_toplevel_images(&outputs)
                 .await
                 .unwrap_or_default();
+            // Keep the untouched pixels: Translate repaints these, so a second
+            // translation starts from the original glyphs, not the first result.
+            let output_images_pristine = output_images
+                .iter()
+                .map(|(name, image)| (name.clone(), image.rgba.clone()))
+                .collect();
             // TODO: Maybe replace config's Choice with Choice from this file
             let choice = match config.choice {
                 config::screenshot::Choice::Output(Some(output))
@@ -538,6 +588,10 @@ impl Screenshot {
                     // TODO cover all outputs at start of rectangle?
                     choice,
                     // will be updated
+                    pristine: output_images_pristine,
+                    target_index: target_index(),
+                    translating: false,
+                    status: None,
                 }))
                 .await
             {
@@ -595,6 +649,13 @@ pub(crate) fn view(portal: &CosmicPortal, id: window::Id) -> cosmic::Element<'_,
         return space::horizontal().width(Length::Fixed(1.0)).into();
     };
     let theme = portal.core.system_theme().cosmic();
+    // Window picker mode has no persistent selected area of its own, so there
+    // is nothing for Translate to repaint there.
+    let translate_enabled = match &args.choice {
+        Choice::Rectangle(rect, _) => rect.dimensions().is_some(),
+        Choice::Output(_) => true,
+        Choice::Window(..) => false,
+    };
     KeyboardWrapper::new(
         crate::widget::screenshot::ScreenshotSelection::new(
             args.choice.clone(),
@@ -610,6 +671,17 @@ pub(crate) fn view(portal: &CosmicPortal, id: window::Id) -> cosmic::Element<'_,
             &portal.location_options,
             args.location as usize,
             Msg::Location,
+            TranslateControls {
+                languages: lang::LANGS,
+                selected: args.target_index,
+                busy: args.translating,
+                enabled: translate_enabled,
+                status: args.status.as_deref(),
+                on_translate: Msg::Translate {
+                    output: output.name.clone(),
+                },
+                on_language: Box::new(Msg::TargetLanguage),
+            },
             theme.spacing,
             i as u128,
         ),
@@ -878,6 +950,172 @@ pub fn update_msg(
                 cosmic::Task::none()
             }
         }
+        Msg::TargetLanguage(index) => {
+            if let Some(args) = portal.screenshot_args.as_mut() {
+                if index < lang::LANGS.len() {
+                    args.target_index = index;
+                }
+            } else {
+                tracing::error!("Failed to find screenshot Args for TargetLanguage message.");
+            }
+            cosmic::Task::none()
+        }
+        Msg::Translate { output } => {
+            if portal.screenshot_args.is_none() {
+                tracing::error!("Failed to find screenshot Args for Translate message.");
+                return cosmic::Task::none();
+            }
+            if portal
+                .screenshot_args
+                .as_ref()
+                .is_some_and(|args| args.translating)
+            {
+                return cosmic::Task::none();
+            }
+
+            // Resolve the same area Capture would export: the chosen output
+            // whole, or the drawn rectangle clipped to the output this dialog
+            // belongs to. `output` is the dialog's own output; a rectangle is
+            // drawn in that output's view.
+            let choice = portal
+                .screenshot_args
+                .as_ref()
+                .map(|args| args.choice.clone());
+            let (name, selection) = match choice {
+                Some(Choice::Output(name)) => (name, None),
+                Some(Choice::Rectangle(rect, _)) => (output, Some(rect)),
+                Some(Choice::Window(..)) => {
+                    set_status(
+                        portal,
+                        Some(
+                            "Translate works in area or screen mode; pick an area first"
+                                .to_string(),
+                        ),
+                    );
+                    return cosmic::Task::none();
+                }
+                _ => return cosmic::Task::none(),
+            };
+
+            let Some(base) = portal
+                .screenshot_args
+                .as_ref()
+                .and_then(|args| args.pristine.get(&name).cloned())
+            else {
+                set_status(
+                    portal,
+                    Some("the capture for this screen is no longer available".to_string()),
+                );
+                return cosmic::Task::none();
+            };
+
+            let Some(output_state) = portal.outputs.iter().find(|state| state.name == name) else {
+                set_status(
+                    portal,
+                    Some("this screen is no longer connected".to_string()),
+                );
+                return cosmic::Task::none();
+            };
+            let output_rect = LogicalRect {
+                left: output_state.logical_pos.0,
+                top: output_state.logical_pos.1,
+                right: output_state.logical_pos.0 + output_state.logical_size.0 as i32,
+                bottom: output_state.logical_pos.1 + output_state.logical_size.1 as i32,
+            };
+            let dimensions = base.dimensions();
+            let region = match selection {
+                Some(rect) => translate::region_for_selection(
+                    LogicalRect {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    },
+                    output_rect,
+                    dimensions,
+                ),
+                None => Some(Region::whole(dimensions)),
+            };
+            let Some(region) = region else {
+                set_status(portal, Some("select an area to translate".to_string()));
+                return cosmic::Task::none();
+            };
+
+            let Some(target) = portal.screenshot_args.as_ref().map(|args| args.target()) else {
+                return cosmic::Task::none();
+            };
+            if let Some(args) = portal.screenshot_args.as_mut() {
+                args.translating = true;
+                args.status = None;
+            }
+
+            // OCR and the HTTP call take seconds; they run off the UI thread so
+            // the dialog stays responsive and a slow sidecar never freezes it.
+            cosmic::Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        translate::run(name, base, region, target)
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(format!("the translation task failed: {error}"))
+                    })
+                },
+                |result| cosmic::Action::App(crate::app::Msg::Screenshot(Msg::Translated(result))),
+            )
+        }
+        Msg::Translated(result) => {
+            let Some(args) = portal.screenshot_args.as_mut() else {
+                tracing::error!("Failed to find screenshot Args for Translated message.");
+                return cosmic::Task::none();
+            };
+            args.translating = false;
+            match result {
+                Ok(done) => {
+                    let Some(base) = args.pristine.get(&done.output) else {
+                        args.status =
+                            Some("the capture for this screen is no longer available".to_string());
+                        return cosmic::Task::none();
+                    };
+                    // Composite first, then swap the buffer: the dialog never
+                    // shows or exports a half-painted image.
+                    let composited = translate::composite(base, &done);
+                    let (width, height) = composited.dimensions();
+                    let handle = cosmic::widget::image::Handle::from_rgba(
+                        width,
+                        height,
+                        composited.as_raw().clone(),
+                    );
+                    args.output_images.insert(
+                        done.output,
+                        ScreenshotImage {
+                            rgba: composited,
+                            handle,
+                        },
+                    );
+                    args.status = Some(if done.drawn == done.lines {
+                        format!(
+                            "{} → {} · {} line(s)",
+                            done.source, done.target.name, done.drawn
+                        )
+                    } else {
+                        format!(
+                            "{} → {} · {} of {} line(s) drawn",
+                            done.source, done.target.name, done.drawn, done.lines
+                        )
+                    });
+                }
+                Err(message) => args.status = Some(message),
+            }
+            cosmic::Task::none()
+        }
+    }
+}
+
+/// Set the one-line feedback under the toolbar, if the dialog still exists.
+fn set_status(portal: &mut CosmicPortal, status: Option<String>) {
+    if let Some(args) = portal.screenshot_args.as_mut() {
+        args.status = status;
     }
 }
 
@@ -896,6 +1134,7 @@ pub fn update_args(
         action,
         location,
         toplevel_images,
+        ..
     } = &args;
 
     if portal.outputs.len() != images.len() {

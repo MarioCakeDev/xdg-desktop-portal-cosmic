@@ -10,7 +10,13 @@ wgpu = ["libcosmic/wgpu"]
 systemd = ["dep:tracing-journald"]
 
 [workspace]
-members = ["cosmic-portal-config"]
+members = [
+    "cosmic-portal-config",
+    "crates/engine",
+    "crates/ocr",
+    "crates/overlay",
+    "crates/translation",
+]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -25,6 +31,12 @@ futures = "0.3"
 image = "0.25"
 cosmic-bg-config = { git = "https://github.com/pop-os/cosmic-bg" }
 cosmic-portal-config = { path = "./cosmic-portal-config" }
+# Translate button: one shared engine, vendored from
+# https://github.com/MarioCakeDev/cosmic-screenshot (see crates/VENDORED.md).
+cosmic-screenshot-ocr = { path = "crates/ocr" }
+cosmic-screenshot-overlay = { path = "crates/overlay" }
+cosmic-screenshot-translation = { path = "crates/translation" }
+cosmic-screenshot-engine = { path = "crates/engine" }
 memmap2 = "0.9.10"
 # pipewire = { git = "https://github.com/pop-os/pipewire-rs" }
 pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", features = [
