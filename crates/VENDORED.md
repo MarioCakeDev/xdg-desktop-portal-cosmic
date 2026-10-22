@@ -10,7 +10,7 @@ These four crates are copied from the cosmic-screenshot fork:
 | `cosmic-screenshot-engine` | `crates/engine` |
 
 - Repository: <https://github.com/MarioCakeDev/cosmic-screenshot>
-- Commit: `e17a03533ea96bd99431932eeb4ea66d5b7a110b`
+- Commit: `b39cc37678c31ac715f22ccd49d1bdba39cc04cd`
   — binarised screenshot OCR (probe → narrow, one psm 6 pass, psm 11 only for
   a short reading), the honest found/kept/translated/drawn counts and the
   `COSMIC_SCREENSHOT_DEBUG_DIR` dump.

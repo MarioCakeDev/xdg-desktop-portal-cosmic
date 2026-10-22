@@ -1,6 +1,6 @@
 //! VENDORED — do not edit here.
 //!
-//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at e17a03533ea96bd99431932eeb4ea66d5b7a110b (crates/ocr).
+//! Source: https://github.com/MarioCakeDev/cosmic-screenshot.git at b39cc37678c31ac715f22ccd49d1bdba39cc04cd (crates/ocr).
 //! Edit there, then run contrib/sync-engine.sh — see crates/VENDORED.md.
 //!
 //! OCR of a captured region.
@@ -126,15 +126,20 @@ const BAND_MARGIN: u32 = 4;
 /// row's colour is worth taking: enough pixels for a mode, and no more.
 const BAND_MIN_SHARE: f32 = 0.05;
 
-/// The longest unbroken run of other-paper pixels a band must hold at least
-/// once, as a share of the row's width.
+/// The unbroken run of other-paper pixels a row needs to count as paper rather
+/// than ink, as a share of the row's width.
 ///
 /// This is what tells a passage from the page's own ink, and a luma distance
 /// from the paper cannot: light text on a dark page sits on the far side of
 /// the split too. Ink is strokes — runs of a few pixels, each broken by the
-/// page's paper — while a passage has at least one row that is one run of its
-/// own paper. Without this test a page line the primary pass dropped became a
-/// band, was re-read upside down and could be repainted as a misreading.
+/// page's paper — while a passage's rows are one run of its own paper.
+///
+/// One such row is not enough: a rule or an underline under a line of ink is a
+/// long run too. [`push_band`] therefore wants a quarter of a band's rows to
+/// clear this, because paper in a passage is an *area* — padding above and
+/// below, and the rows between its lines. The assumption this encodes is that
+/// the passage has that padding; a block cropped flush to its glyphs, with no
+/// paper row at all, is not retried and keeps its pixels.
 const BAND_MIN_RUN_SHARE: f32 = 0.15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1043,10 +1048,10 @@ fn unread_bands(
     }
 
     let mut bands: Vec<Band> = Vec::new();
-    // The band being built, its anchor colour, and whether any of its rows has
+    // The band being built, its anchor colour, and how many of its rows have
     // been one unbroken run of the other *paper* rather than a line of the
     // other ink.
-    let mut current: Option<(Band, f32, bool)> = None;
+    let mut current: Option<(Band, f32, u32)> = None;
     for row in 0..height {
         let opposite = if covered[row as usize] {
             None
@@ -1055,14 +1060,16 @@ fn unread_bands(
         };
         match opposite {
             Some((median, longest)) => {
-                let paper_row = longest >= needed_run;
+                let paper_row = u32::from(longest >= needed_run);
                 match current {
-                    Some((mut band, anchor, paper)) if (median - anchor).abs() <= BAND_FLATNESS => {
+                    Some((mut band, anchor, paper_rows))
+                        if (median - anchor).abs() <= BAND_FLATNESS =>
+                    {
                         band.bottom = row + 1;
-                        current = Some((band, anchor, paper || paper_row));
+                        current = Some((band, anchor, paper_rows + paper_row));
                     }
-                    Some((band, _, paper)) => {
-                        push_band(&mut bands, band, scale, paper);
+                    Some((band, _, paper_rows)) => {
+                        push_band(&mut bands, band, scale, paper_rows);
                         current = Some((
                             Band {
                                 top: row,
@@ -1085,14 +1092,14 @@ fn unread_bands(
                 }
             }
             None => {
-                if let Some((band, _, paper)) = current.take() {
-                    push_band(&mut bands, band, scale, paper);
+                if let Some((band, _, paper_rows)) = current.take() {
+                    push_band(&mut bands, band, scale, paper_rows);
                 }
             }
         }
     }
-    if let Some((band, _, paper)) = current {
-        push_band(&mut bands, band, scale, paper);
+    if let Some((band, _, paper_rows)) = current {
+        push_band(&mut bands, band, scale, paper_rows);
     }
     bands
 }
@@ -1149,11 +1156,12 @@ fn opposite_row(
     Some((winner[1] as f32 / total as f32, longest))
 }
 
-fn push_band(bands: &mut Vec<Band>, band: Band, scale: u32, paper: bool) {
-    if !paper {
-        // Every row here is the other *ink* and never one run of the other
-        // paper: a page line the primary pass dropped, not a passage. Reading
-        // it upside down is how a misreading gets repainted.
+fn push_band(bands: &mut Vec<Band>, band: Band, scale: u32, paper_rows: u32) {
+    if paper_rows * 4 < band.height() {
+        // Fewer than a quarter of these rows are one run of the other paper:
+        // a line of the other ink — even one with a rule or an underline in it,
+        // which is one long run — and not a passage. Reading it upside down is
+        // how a misreading gets repainted.
         return;
     }
     // `band` is in prepared rows, `MIN_BAND_ROWS` in capture pixels.
@@ -2096,6 +2104,52 @@ mod tests {
     }
 
     #[test]
+    fn a_line_of_ink_with_a_rule_under_it_is_not_a_band() {
+        // A rule or an underline is one long run of the other colour inside a
+        // line of the other ink, so "one row is paper" is not enough: a band
+        // needs a quarter of its rows to be paper, which a struck-through or
+        // underlined line does not have.
+        let mut image = image::GrayImage::from_pixel(60, 100, image::Luma([30]));
+        for y in 20..32 {
+            for x in (6..54).step_by(4) {
+                image.put_pixel(x, y, image::Luma([226]));
+            }
+        }
+        // One row of rule, the width of the line.
+        for x in 6..54 {
+            image.put_pixel(x, 27, image::Luma([226]));
+        }
+        assert!(
+            unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1).is_empty(),
+            "one rule row in twelve is not a passage"
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_paper_row_is_not_retried() {
+        // The rule assumes a passage has padding — paper in a passage is an
+        // area. A block cropped flush to its glyph columns has no paper row at
+        // all, so it is not retried and keeps its pixels.
+        let mut image = image::GrayImage::from_pixel(200, 100, image::Luma([30]));
+        for y in 30..70 {
+            for x in 10..190 {
+                image.put_pixel(x, y, image::Luma([220]));
+            }
+        }
+        for x in (10..180).step_by(16) {
+            for y in 30..70 {
+                for dx in 0..10 {
+                    image.put_pixel(x + dx, y, image::Luma([20]));
+                }
+            }
+        }
+        assert!(
+            unread_bands(&image, 30, DEFAULT_THRESHOLD, &[], 1).is_empty(),
+            "a flush block has no paper row to make it a band"
+        );
+    }
+
+    #[test]
     fn only_new_lines_inside_the_band_are_recovered() {
         let band = Band {
             top: 30,
@@ -2229,10 +2283,22 @@ mod tests {
     fn more_bands_than_the_cap_keep_the_tallest_in_page_order() {
         // A two-column page is one narrow band per strip. Refusing every band
         // on the count skipped exactly the layout the retry exists for.
-        let mut image = image::GrayImage::from_pixel(60, 200, image::Luma([30]));
-        for index in 0..6u32 {
-            for y in (10 + index * 30)..(30 + index * 30) {
-                for x in 5..55 {
+        // Six strips, the fifth taller than the rest: a bare truncate keeps the
+        // first four and drops the tall one, which is the mutant this pins.
+        let strips: [(u32, u32); 6] = [
+            (10, 20),
+            (40, 20),
+            (70, 20),
+            (100, 20),
+            (130, 40),
+            (180, 20),
+        ];
+        let mut image = image::GrayImage::from_pixel(60, 210, image::Luma([30]));
+        for (top, height) in strips {
+            for y in top..(top + height) {
+                // Narrow enough that the dark page still names the crop's
+                // polarity: the strips are the minority of the pixels.
+                for x in 15..45 {
                     image.put_pixel(x, y, image::Luma([220]));
                 }
             }
@@ -2264,11 +2330,21 @@ mod tests {
             confidence: 90.0,
         });
         let kept = retry_bands(&prepared, &reading);
+        let scale = prepared.scale;
         assert_eq!(kept.len(), MAX_RETRY_BANDS, "{kept:?}");
         assert_eq!(
-            kept,
-            all[..MAX_RETRY_BANDS].to_vec(),
-            "the tallest bands, back in page order"
+            kept.iter().map(|band| band.top / scale).collect::<Vec<_>>(),
+            vec![10, 40, 70, 130],
+            "the tall strip survives, the fourth short one gives way"
+        );
+        assert!(
+            !kept.iter().any(|band| band.top == 100 * scale),
+            "the first four are not simply kept"
+        );
+        assert_eq!(
+            kept[3].height(),
+            40 * scale,
+            "the tall strip is the one kept"
         );
     }
 
@@ -2279,11 +2355,11 @@ mod tests {
         // dropped at the other.
         let band = Band { top: 0, bottom: 12 };
         let mut kept = Vec::new();
-        push_band(&mut kept, band, 1, true);
+        push_band(&mut kept, band, 1, band.height());
         assert_eq!(kept, vec![band], "12 capture rows is already a band");
 
         let mut dropped = Vec::new();
-        push_band(&mut dropped, band, 2, true);
+        push_band(&mut dropped, band, 2, band.height());
         assert!(
             dropped.is_empty(),
             "at 2× the floor is 16 prepared rows, got 12"
